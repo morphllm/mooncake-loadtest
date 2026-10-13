@@ -73,10 +73,11 @@ tests/test_runner.py      # runs payload functions with a fake I/O boundary
 ```
 
 ```sh
+sudo apt-get install -y fio # Linux runtime job validation
 python -m pip install numpy
 bash -n mooncake-loadtest.sh
 shellcheck -S error mooncake-loadtest.sh
 python -m unittest discover -s tests -v
 ```
 
-Unit checks cover actual put/get memory transfers, successful-byte accounting, misses, deadline-bounded refusals, incomplete responses, shared mixed windows, dead workers, scoped process cleanup, rolling accepted-key reads, managed runtime reuse and report rendering. Real RDMA/L3 hardware qualification is a separate server run; unit tests cannot establish its throughput.
+Unit checks cover actual put/get memory transfers, successful-byte accounting, misses, deadline-bounded refusals, incomplete responses, shared mixed windows, dead workers, scoped process cleanup, rolling accepted-key reads, managed runtime reuse, real fio job parsing and read-only enforcement, and report rendering. Real RDMA/L3 hardware qualification is a separate server run; unit tests cannot establish its throughput.

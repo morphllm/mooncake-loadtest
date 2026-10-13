@@ -2195,6 +2195,24 @@ phase_dram() {
   done; done
 }
 
+raw_fio_job() {
+  local eng=$1 bs=$2 rw=$3 rt=$4; shift 4
+  case "$rw" in read|randread) ;; *) die "raw fio permits read workloads only" ;; esac
+  printf '[global]\nioengine=%s\ndirect=1\niodepth=32\nbs=%s\nrw=%s\ntime_based=1\nruntime=%s\nramp_time=2\nnorandommap=1\nrandrepeat=0\n' "$eng" "$bs" "$rw" "$rt"
+  local path
+  for path in "$@"; do printf '[%s]\nfilename=%s\n' "${path##*/}" "$path"; done
+}
+
+fs_fio_job() {
+  local tag=$1 dir=$2 eng=$3 per_job=$4 bytes=$5 seconds=$6
+  case $tag in
+    bufwrite) printf '[global]\ndirectory=%s\nioengine=psync\ndirect=0\nrw=write\nbs=1M\nnumjobs=8\nfilesize=1G\nsize=%sM\nend_fsync=1\nfsync_on_close=1\nfilename_format=b.$jobnum.$filenum\ngroup_reporting=1\n[w]\n' "$dir" "$per_job" ;;
+    dirwrite) printf '[global]\ndirectory=%s\nioengine=%s\ndirect=1\nrw=write\nbs=1M\niodepth=32\nnumjobs=8\nfilesize=1G\nsize=%sM\nfilename_format=d.$jobnum.$filenum\ngroup_reporting=1\n[w]\n' "$dir" "$eng" "$per_job" ;;
+    objread) printf '[global]\ndirectory=%s\nioengine=%s\ndirect=1\nrw=randread\nbs=%s\nblockalign=4k\niodepth=32\nnumjobs=8\nfilesize=1G\nsize=%sM\nfilename_format=b.$jobnum.$filenum\ntime_based=1\nruntime=%s\nnorandommap=1\nrandrepeat=0\ngroup_reporting=1\n[r]\n' "$dir" "$eng" "$bytes" "$per_job" "$seconds" ;;
+    *) die "unknown filesystem benchmark: $tag" ;;
+  esac
+}
+
 phase_nvme_raw() {   # read-only: safe on drives that carry data and mounted filesystems
   local ns=() d
   for d in /sys/block/nvme*n*; do [[ ${d##*/} =~ ^nvme[0-9]+n[0-9]+$ ]] && ns+=("${d##*/}"); done
@@ -2204,11 +2222,11 @@ phase_nvme_raw() {   # read-only: safe on drives that carry data and mounted fil
   for tag in seqread objread; do
     local bs=1M rw=read rt=$RAW_S
     [ "$tag" = objread ] && { bs=$OBJ_ALIGNED; rw=randread; rt=$(( (RAW_S + 1) / 2 )); }
-    { printf '[global]\nioengine=%s\ndirect=1\nreadonly=1\niodepth=32\nbs=%s\nrw=%s\ntime_based=1\nruntime=%s\nramp_time=2\nnorandommap=1\nrandrepeat=0\n' "$eng" "$bs" "$rw" "$rt"
-      for d in "${ns[@]}"; do printf '[%s]\nfilename=/dev/%s\n' "$d" "$d"; done; } >"$S/nvme/raw-$tag.fio"
+    local paths=(); for d in "${ns[@]}"; do paths+=("/dev/$d"); done
+    raw_fio_job "$eng" "$bs" "$rw" "$rt" "${paths[@]}" >"$S/nvme/raw-$tag.fio"
     log "nvme: raw $tag on ${#ns[@]} drives at once (read-only, ${rt}s, bs $bs, QD32)"
     local t0; t0=$(now)
-    fio --output-format=json --output="$S/nvme/raw-$tag.json" "$S/nvme/raw-$tag.fio" >/dev/null 2>"$S/nvme/raw-$tag.err" || warn "raw $tag fio failed (see nvme/raw-$tag.err)"
+    fio --readonly --output-format=json --output="$S/nvme/raw-$tag.json" "$S/nvme/raw-$tag.fio" >/dev/null 2>"$S/nvme/raw-$tag.err" || warn "raw $tag fio failed (see nvme/raw-$tag.err)"
     mark "nvme:raw-$tag" "$t0" "$(now)" "$S/marks.jsonl"
     "$PY" -c 'import json,sys; j=json.load(open(sys.argv[1])); print("   ", "  ".join(f"{x[\"jobname\"]} {x[\"read\"][\"bw_bytes\"]/1e9:.2f}" for x in j["jobs"]), f"| total {sum(x[\"read\"][\"bw_bytes\"] for x in j[\"jobs\"])/1e9:.1f} GB/s")' "$S/nvme/raw-$tag.json" 2>/dev/null >&2 || true
   done
@@ -2223,11 +2241,7 @@ phase_fs() {   # ceilings of the exact L3 directories the legs will use
     local t0; t0=$(now); local pids=()
     for i in $(seq 0 $((n - 1))); do
       dir=$(lane_field "$i" disk_dir)/fio; mkdir -p "$dir"
-      case $tag in
-        bufwrite) printf '[global]\ndirectory=%s\nioengine=psync\ndirect=0\nrw=write\nbs=1M\nnumjobs=8\nfilesize=1G\nsize=%sM\nend_fsync=1\nfsync_on_close=1\nfilename_format=b.$jobnum.$filenum\ngroup_reporting=1\n[w]\n' "$dir" "$per_job" ;;
-        dirwrite) printf '[global]\ndirectory=%s\nioengine=%s\ndirect=1\nrw=write\nbs=1M\niodepth=32\nnumjobs=8\nfilesize=1G\nsize=%sM\nfilename_format=d.$jobnum.$filenum\ngroup_reporting=1\n[w]\n' "$dir" "$eng" "$per_job" ;;
-        objread)  printf '[global]\ndirectory=%s\nioengine=%s\ndirect=1\nrw=randread\nbs=%s\nblockalign=4k\niodepth=32\nnumjobs=8\nfilesize=1G\nsize=%sM\nfilename_format=b.$jobnum.$filenum\ntime_based=1\nruntime=%s\nnorandommap=1\nrandrepeat=0\ngroup_reporting=1\n[r]\n' "$dir" "$eng" "$OBJ_ALIGNED" "$per_job" "$RAW_S" ;;
-      esac >"$S/nvme/fs-$tag-$i.fio"
+      fs_fio_job "$tag" "$dir" "$eng" "$per_job" "$OBJ_ALIGNED" "$RAW_S" >"$S/nvme/fs-$tag-$i.fio"
       fio --output-format=json --output="$S/nvme/fs-$tag-$i.json" "$S/nvme/fs-$tag-$i.fio" >/dev/null 2>"$S/nvme/fs-$tag-$i.err" &
       pids+=($!)
     done
