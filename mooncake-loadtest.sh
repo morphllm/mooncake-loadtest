@@ -701,15 +701,23 @@ def offset(k, slots):
 
 def rolling_keys(ring, start, count):
     """Snapshot recent accepted keys once per batch; empty slots never become gets."""
+    ready = []
     with ring.get_lock():
-        ready = [ring[(start + i) % len(ring)] for i in range(len(ring))]
-    return [key for key in ready if key >= 0][:count]
+        slots = ring.get_obj()
+        for i in range(len(slots)):
+            key = slots[(start + i) % len(slots)]
+            if key >= 0:
+                ready.append(key)
+                if len(ready) == count:
+                    break
+    return ready
 
 
 def publish_keys(ring, keys, writer, writers, cursor):
     with ring.get_lock():
+        slots = ring.get_obj()
         for key in keys:
-            ring[(writer + cursor * writers) % len(ring)] = key
+            slots[(writer + cursor * writers) % len(slots)] = key
             cursor += 1
     return cursor
 
