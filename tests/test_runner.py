@@ -71,7 +71,13 @@ class RunnerTests(unittest.TestCase):
         self.lane = {'idx': 0, 'local_ip': '127.0.0.1', 'local_dev': '', 'master': 'local'}
 
     def run_worker(self, commands, ring=None):
-        cmd, out = queue.Queue(), queue.Queue()
+        class PhaseQueue(queue.Queue):
+            def get(self, *args, **kwargs):
+                command = super().get(*args, **kwargs)
+                if isinstance(command, dict) and '_duration' in command:
+                    command['deadline'] = time.time() + command.pop('_duration')
+                return command
+        cmd, out = PhaseQueue(), queue.Queue()
         for command in commands: cmd.put(command)
         cmd.put(None)
         fake = types.ModuleType('mooncake.store')
@@ -97,7 +103,7 @@ class RunnerTests(unittest.TestCase):
     def test_refusal_stops_at_phase_deadline(self):
         Store.refusal = True
         started = time.monotonic()
-        result, = self.run_worker([self.command('put', deadline=time.time() + .1)])
+        result, = self.run_worker([{**self.command('put'), '_duration': .1}])
         self.assertLess(time.monotonic() - started, 3)
         self.assertEqual(result['bytes'], 0)
         self.assertEqual(result['errors'], {})
@@ -128,7 +134,7 @@ class RunnerTests(unittest.TestCase):
         import multiprocessing as mp
         ring = mp.Array('q', [-1] * 4)
         put = {**self.command('put'), 'publish': True, 'writer': 0, 'writers': 1}
-        get = {**self.command('get'), 'rolling': True, 'deadline': time.time() + .3}
+        get = {**self.command('get'), 'rolling': True, '_duration': .3}
         inserted, read = self.run_worker([put, get], ring)
         self.assertEqual(set(bench.rolling_keys(ring, 0, 4)), {0, 1, 2, 3})
         self.assertGreater(read['bytes'], 0)
@@ -136,7 +142,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(read['mismatch'], 0)
         Store.refusal = True
         empty = mp.Array('q', [-1] * 4)
-        put['deadline'] = time.time() + .1
+        put['_duration'] = .1
         self.run_worker([put], empty)
         self.assertEqual(bench.rolling_keys(empty, 0, 4), [])
 
