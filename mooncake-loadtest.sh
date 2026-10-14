@@ -1204,7 +1204,7 @@ TH = {
     "nvme_temp_warn_c": 70, "nic_module_temp_warn_c": 70, "percent_used_warn": 80,
     "bottleneck_saturated": 0.85, "bottleneck_bound": 0.60,
 }
-COL = {"PASS": "\033[32m", "WARN": "\033[33m", "FAIL": "\033[31m", "INFO": "\033[36m", "SKIP": "\033[90m"} if sys.stdout.isatty() else {}
+COL = {"PASS": "\033[32m", "WARN": "\033[33m", "FAIL": "\033[31m", "INFO": "\033[36m", "SKIP": "\033[90m"} if sys.stdout.isatty() and "NO_COLOR" not in os.environ else {}
 rows, bottlenecks, notes = [], [], []
 
 
@@ -1229,7 +1229,8 @@ def strict(v):
 
 def load(p, default=None):
     try:
-        return json.load(open(p))
+        with open(p) as f:
+            return json.load(f)
     except (OSError, ValueError):
         return default
 
@@ -1321,6 +1322,7 @@ def cpulist(s):
 
 # ── load the run ────────────────────────────────────────────────────────────────────────────
 def main(run):
+    rows.clear(); bottlenecks.clear(); notes.clear()
     run = Path(run)
     meta = load(run / "meta.json", {})
     S, C = run / "server", run / "client"
@@ -1352,8 +1354,8 @@ def main(run):
         add(sec, "transport is RDMA", proto, "rdma", "FAIL" if meta.get("protocol_requested") != "tcp" else "WARN",
             "TCP stages every byte through CPU and sockets: not a production fast path")
     if single:
-        add(sec, "topology", "single host (RDMA loopback)", "", "INFO",
-            "store and load generator share the box: wire numbers are NIC loopback (port counters may not count it), client CPU competes with the leg; "
+        add(sec, "topology", f"single host ({proto} diagnostic)", "", "INFO",
+            "store and load generator share the box; local memory copies or loopback may bypass physical NIC limits; client CPU competes with the leg; "
             "run server + client on two boxes for the real wire")
     if not single and abs(off) > 0.5:
         add(sec, "clock offset server-client", f"{off:+.2f} s", "|x| <= 0.5 s", "WARN", "windows are corrected by this offset; run NTP on both")
@@ -1391,7 +1393,7 @@ def main(run):
             lk = v["pcie"]
             used = any(l.get("dev") == dev for l in (lanes if h == "server" else clients))
             if lk["cur"] != lk["max"]:
-                add(sec, f"{h} {dev} PCIe link", f"{lk['cur']} (max {lk['max']})", lk["max"], "FAIL" if used else "WARN", "downtrained: riser, slot or retimer")
+                add(sec, f"{h} {dev} PCIe link", f"{lk['cur']} (max {lk['max']})", lk["max"], "FAIL" if used else "WARN", "adapter capability comparison; platform/slot capability not measured; narrower lanes may cap throughput")
             mrr = v.get("lspci", {}).get("max_read_req")
             if used and mrr and mrr < 4096:
                 add(sec, f"{h} {dev} PCIe MaxReadReq", f"{mrr} B", ">= 4096 B", "WARN", "small read requests cap RDMA READ / send DMA throughput (setpci or mlxconfig)")
@@ -1404,18 +1406,18 @@ def main(run):
                 add(sec, f"{h} {dev} NUMA node", "unknown (-1)", "known", "WARN", "cannot pin the leg next to the NIC")
             for ndv, mod in v.get("module", {}).items():
                 if mod.get("alarms_on"):
-                    add(sec, f"{h} {dev} optics alarms", "; ".join(mod["alarms_on"][:4]), "none", "FAIL", "transceiver reports alarm/warning flags")
+                    add(sec, f"{h} {dev} optics alarms", "; ".join(mod["alarms_on"][:4]), "none", "WARN", "transceiver reports flags; an uncabled port may report alarms, so compare with intended cabling")
         for hca, fw in fws.items():
             if len(fw) > 1:
-                add(sec, f"{h} NIC firmware consistent ({hca})", ",".join(sorted(fw)), "one version", "WARN")
+                add(sec, f"{h} NIC firmware consistent ({hca})", ",".join(sorted(fw)), "one approved baseline", "WARN", "confirm approved baseline; performance impact unproven")
         mods = {}
         for ns, v in iv.get("nvme", {}).items():
             mods.setdefault(v["model"], set()).add(v["fw"])
             if v["pcie"]["cur"] != v["pcie"]["max"]:
-                add(sec, f"{h} {ns} PCIe link", f"{v['pcie']['cur']} (max {v['pcie']['max']})", v["pcie"]["max"], "FAIL", "downtrained bay, backplane or cable")
+                add(sec, f"{h} {ns} PCIe link", f"{v['pcie']['cur']} (max {v['pcie']['max']})", v["pcie"]["max"], "FAIL", "adapter capability comparison; platform/slot capability not measured; narrower lanes may cap throughput")
         for m, fw in mods.items():
             if len(fw) > 1:
-                add(sec, f"{h} NVMe firmware consistent ({m})", ",".join(sorted(fw)), "one version", "WARN")
+                add(sec, f"{h} NVMe firmware consistent ({m})", ",".join(sorted(fw)), "one approved baseline", "WARN", "confirm approved baseline; performance impact unproven")
         for line in iv.get("dmesg_pcie_limited", [])[:6]:
             add(sec, f"{h} dmesg PCIe bandwidth", line.strip()[-110:], "no 'limited by'", "FAIL" if "limited by" in line else "WARN")
     for l in lanes:
@@ -1442,7 +1444,10 @@ def main(run):
         i, line = l["idx"], l.get("rate_gbit")
         for op in ("write", "read"):
             v = fab.get(f"te-{op}-{i}")
-            if line and v is not None:
+            if single and line and v is not None and v > line:
+                add(sec, f"lane {i} Transfer Engine {op} Gb/s", fmt(v, "{:.1f}"), "local diagnostic; unqualified", "INFO",
+                    f"{v / line:.0%} of adapter line rate cannot qualify physical NIC throughput on one host")
+            elif line and v is not None:
                 floor(sec, f"lane {i} Transfer Engine {op} Gb/s", v, TH["te_min_frac_line"] * line, TH["te_warn_frac_line"] * line, "{:.1f}",
                       f"{v / line:.0%} of {line:.0f} Gb/s line rate (64 KiB slices, the store's wire message)")
             elif v is not None:
@@ -1452,7 +1457,10 @@ def main(run):
             if v:
                 ceil_te[(i, op)] = v / 8
             pv = fab.get(f"perftest-{op}-{i}")
-            if pv is not None and line:
+            if single and pv is not None and line and pv > line:
+                add(sec, f"lane {i} perftest ib_{op}_bw Gb/s", fmt(pv, "{:.1f}"), "local diagnostic; unqualified", "INFO",
+                    "above physical adapter line rate; verify transport and counters across separate hosts")
+            elif pv is not None and line:
                 floor(sec, f"lane {i} perftest ib_{op}_bw Gb/s", pv, TH["perftest_min_frac_line"] * line, None, "{:.1f}",
                       f"{pv / line:.0%} of line; raw verbs reference" + (f"; Mooncake reaches {v / pv:.0%} of it" if v else ""))
                 if v and v < 0.85 * pv:
@@ -1667,31 +1675,17 @@ def main(run):
         errors_section(h, before.get(h) or {}, after.get(h) or {}, inv.get(h) or {}, series.get(h), W)
 
     # ── output ──────────────────────────────────────────────────────────────────────────────
-    peak_lines = ["", "Observed payload bandwidth (GB/s; best tested concurrency, not certified hardware peak)",
-                  "lane workload             successful offered workers seconds misses errors mismatch final_refused status"]
-    for li in (bench or {}).get("config", {}).get("lanes", []):
-        lane_id = str(li["idx"])
-        for label, prefix in (("sustained put", "put_sustained@"), ("hot get", "get_dram@"), ("L3 candidate get", "get_nvme")):
-            candidates = [values[lane_id] for name, values in bench.get("phases", {}).items()
-                          if name.startswith(prefix) and lane_id in values]
-            if candidates:
-                clean = [r for r in candidates if not r["errors"] and not r["misses"] and not r["mismatch"] and r["bytes"] > 0]
-                r = max(clean or candidates, key=lambda x: x["gbps"])
-                status = "clean observed" if clean else "invalid/errorful"
-                peak_lines.append(f"{lane_id:>4} {label:<20} {r['gbps']:9.3f} {r.get('offered_gbps', r['gbps']):7.3f} {r['workers']:7} {r['seconds']:7.1f} {r['misses']:6} {sum(r['errors'].values()):6} {r['mismatch']:8} {r.get('deadline_refused', 0):13} {status}")
-        mixed = bench.get("phases", {}).get("mixed", {}).get(lane_id, {})
-        for direction, r in mixed.items():
-            status = "clean observed" if not r["errors"] and not r["misses"] and not r["mismatch"] and r["bytes"] > 0 else "invalid/errorful"
-            peak_lines.append(f"{lane_id:>4} {'mixed ' + direction:<20} {r['gbps']:9.3f} {r.get('offered_gbps', r['gbps']):7.3f} {r['workers']:7} {r['seconds']:7.1f} {r['misses']:6} {sum(r['errors'].values()):6} {r['mismatch']:8} {r.get('deadline_refused', 0):13} {status}")
-        if mixed:
-            peak_lines.append(f"     mixed aggregate      {sum(r['gbps'] for r in mixed.values()):9.3f} (shared measurement window)")
-    peak_lines.extend(["Qualification: observed only; verify cross-host RDMA counters and per-window L3 restores.",
-                       "Hot/L3 cohorts are placement candidates; mixed gets use a bounded ring of recently accepted puts.",
-                       "Integrity checks sample four 4 KiB spans; latency is per batch, not per object."])
-    out = "\n".join(peak_lines) + "\n\n" + render(run, meta, info)
+    traffic = traffic_rows(bench)
+    qualification = ("Observed payload rates only: verify cross-host RDMA counters and per-window L3 restores. "
+                     "Hot/L3 cohorts are placement candidates; sampled content checks are not full-object integrity checks.")
+    document = {"meta": meta, "qualification": qualification, "traffic": traffic,
+                "hardware": hardware_rows(inv, S), "rows": rows,
+                "bottlenecks": [{"phase": p, **b} for p, b in bottlenecks], "notes": notes, "thresholds": TH}
+    out = traffic_terminal(traffic) + "\n\n" + render(run, meta, info)
     (run / "report.txt").write_text(re.sub(r"\033\[[0-9;]*m", "", out))
-    json.dump({"rows": rows, "bottlenecks": [{"phase": p, **b} for p, b in bottlenecks], "notes": notes, "thresholds": TH},
-              open(run / "report.json", "w"), indent=1, default=str)
+    (run / "report.html").write_text(report_html(document))
+    with open(run / "report.json", "w") as f:
+        json.dump(document, f, indent=1, default=str)
     print(out)
     return 1 if any(r["verdict"] == "FAIL" for r in rows) else 0
 
@@ -1765,7 +1759,7 @@ def analyze(series, win, inv, lanes, clients, info, single, ceilings, kind, extr
         for l in mine:
             key = l.get("dev") or l.get("netdev")
             v = st["nic"].get(key)
-            if v and l.get("rate_gbit"):
+            if not single and v and l.get("rate_gbit"):
                 lr = l["rate_gbit"] / 8
                 u = max(v["tx"], v["rx"]) / lr
                 cands.append((u, f"{h} NIC {key} wire", f"tx {v['tx']:.2f} rx {v['rx']:.2f} GB/s of {lr:.1f} line ({u:.0%})"))
@@ -1782,9 +1776,9 @@ def analyze(series, win, inv, lanes, clients, info, single, ceilings, kind, extr
                 cw = raw.get("seqwrite", {}).get(d, {}).get("gbps")
                 ur = dv["read"] / cr if cr else 0
                 uw = dv["write"] / cw if cw else 0
-                u = max(ur, uw, dv["util"] * 0.7)   # io_ticks saturates at 1 with QD1 on NVMe: weak evidence
+                u = dv["util"] * 0.7   # io_ticks saturates at 1 with QD1 on NVMe: weak evidence
                 cands.append((u, f"server NVMe {d}", f"r {dv['read']:.2f} w {dv['write']:.2f} GB/s, busy {dv['util']:.0%}, in-flight {dv['inflight']:.1f}"
-                              + (f", {ur:.0%} of its read ceiling" if cr else "") + (f", {uw:.0%} of its write ceiling" if cw else "")))
+                              + (f", {ur:.0%} of raw read reference measured under all-drive load (not an isolated ceiling)" if cr else "") + (f", {uw:.0%} of raw write reference" if cw else "")))
             fs = ceilings.get("fs", {}) if ceilings else {}
             for l in lanes:
                 i = l["idx"]
@@ -1793,7 +1787,7 @@ def analyze(series, win, inv, lanes, clients, info, single, ceilings, kind, extr
                 for tag, val, what in (("objread", lr_, "read"), ("bufwrite", lw, "write")):
                     c = fs.get((i, tag))
                     if c and val > 0.05:
-                        cands.append((val / c, f"server lane {i} L3 filesystem {what}", f"{val:.2f} of {c:.2f} GB/s fio ceiling ({val / c:.0%})"))
+                        facts.append(f"server lane {i} L3 filesystem {what}: {val:.2f} GB/s vs observed fio reference {c:.2f} GB/s ({val / c:.0%}); reference comparison does not prove saturation")
             if disks:
                 facts.append(f"L3 disks: read {agg_r:.2f} GB/s, write {agg_w:.2f} GB/s total")
             m = st["mem"]
@@ -2071,6 +2065,238 @@ def rdma_why(name):
         if k in n:
             return why
     return "error counter"
+
+
+def traffic_rows(bench):
+    """All observed workloads, preserving numeric units and shared mixed windows."""
+    result = []
+    def append(lane, name, stat):
+        seconds = stat.get("seconds")
+        gbps = stat.get("gbps")
+        offered = stat.get("offered_gbps")
+        errors = stat.get("errors", {})
+        error_count = sum(errors.values()) if isinstance(errors, dict) else int(errors or 0)
+        misses, mismatch = int(stat.get("misses", 0)), int(stat.get("mismatch", 0))
+        refused = int(stat.get("deadline_refused", 0))
+        refusals = int(stat.get("refusals", 0))
+        status, detail = "INFO", "clean observed"
+        if error_count or misses or mismatch or not stat.get("bytes") or (seconds is not None and seconds <= 0):
+            status, detail = "FAIL", "invalid/errorful"
+        elif refused or refusals:
+            status, detail = "WARN", "capacity limited"
+        if any(stat.get(k) is None for k in ("bytes", "gbps", "seconds", "objs", "workers", "misses", "errors", "mismatch")):
+            status, detail = "SKIP", "not measured"
+        if stat.get("bytes") and (seconds is None or seconds <= 0):
+            status, detail = "FAIL", "invalid/errorful"
+        result.append({"lane": str(lane), "workload": name, "gbps": gbps, "gbits": gbps * 8 if gbps is not None else None,
+                       "offered_gbps": offered, "offered_gbits": offered * 8 if offered is not None else None,
+                       "objps": stat["objs"] / seconds if seconds and stat.get("objs") is not None else None, "seconds": seconds,
+                       "workers": stat.get("workers"), "bytes": stat.get("bytes"), "objects": stat.get("objs"),
+                       "lat_ms": stat.get("lat_ms", {}), "misses": stat.get("misses"), "errors": error_count if "errors" in stat else None,
+                       "error_codes": errors, "mismatch": stat.get("mismatch"), "deadline_refused": stat.get("deadline_refused"), "refusals": stat.get("refusals"),
+                       "status": status, "detail": detail})
+    for name, lane_data in (bench or {}).get("phases", {}).items():
+        if name == "exist":
+            continue
+        for lane, stats in sorted(lane_data.items(), key=lambda item: int(item[0])):
+            if name != "mixed":
+                append(lane, name, stats)
+                continue
+            parts = [stats[k] for k in ("put", "get") if k in stats]
+            for direction in ("put", "get"):
+                if direction in stats:
+                    append(lane, "mixed " + direction, stats[direction])
+            if len(parts) == 2:
+                windows = [p.get("window") for p in parts]
+                common = windows[0] and windows[0] == windows[1]
+                seconds = (windows[0][1] - windows[0][0]) if common else None
+                errors = {}
+                for p in parts:
+                    for code, count in p.get("errors", {}).items():
+                        errors[code] = errors.get(code, 0) + count
+                byte_count = sum(p.get("bytes", 0) for p in parts)
+                append(lane, "mixed aggregate", {"seconds": seconds, "gbps": byte_count / seconds / 1e9 if seconds and seconds > 0 else None,
+                    "offered_gbps": sum(p["offered_gbps"] for p in parts) if common and all("offered_gbps" in p for p in parts) else None,
+                    "bytes": byte_count, "objs": sum(p.get("objs", 0) for p in parts),
+                    "workers": sum(p.get("workers", 0) for p in parts), "errors": errors,
+                    **{k: sum(p.get(k, 0) for p in parts) for k in ("misses", "mismatch", "deadline_refused", "refusals")}})
+                if common and seconds > 0:
+                    result[-1]["detail"] += "; shared measurement window"
+                else:
+                    result[-1].update(status="FAIL", detail="incompatible measurement windows; unqualified")
+    def ordering(row):
+        phase = row["workload"]
+        category = (0 if phase == "put" else 1 if phase.startswith("put_sustained@") else
+                    2 if phase.startswith("get_dram@") else 3 if phase == "get_nvme" else 4)
+        concurrency = int(phase.split("@")[1]) if "@" in phase else {"mixed put": 0, "mixed get": 1, "mixed aggregate": 2}.get(phase, 0)
+        return int(row["lane"]), category, concurrency
+    return sorted(result, key=ordering)
+
+
+def hardware_rows(inventory, server_dir):
+    """Join captured inventory with fio outcomes; missing measurements remain null."""
+    drives, nics = [], []
+    if "nvme" in inventory or "nics" in inventory:
+        inventory = {"server": inventory}
+    fio = {tag: load(Path(server_dir) / "nvme" / f"raw-{tag}.json", {}) for tag in ("seqread", "objread")}
+    measured = {tag: {j.get("jobname"): j for j in data.get("jobs", [])} for tag, data in fio.items()}
+    for host, inv in inventory.items():
+        for name, drive in (inv or {}).get("nvme", {}).items():
+            record = {"host": host, "device": name, "model": drive.get("model"), "firmware": drive.get("fw"),
+                      "capacity_gib": drive["bytes"] / 2**30 if drive.get("bytes") is not None else None, "numa": drive.get("pcie", {}).get("numa"),
+                      "pcie": drive.get("pcie", {}).get("cur"), "adapter_pcie": drive.get("pcie", {}).get("max")}
+            for tag in ("seqread", "objread"):
+                job = measured[tag].get(name, {}) if host == "server" else {}
+                read = job.get("read", {})
+                percentile = read.get("clat_ns", {}).get("percentile", {})
+                record[tag + "_gbps"] = read["bw_bytes"] / 1e9 if "bw_bytes" in read else None
+                record[tag + "_p99_ms"] = percentile.get("99.000000", percentile.get("99.00"))
+                if record[tag + "_p99_ms"] is not None:
+                    record[tag + "_p99_ms"] /= 1e6
+                record[tag + "_errors"] = job.get("error")
+            drives.append(record)
+        for name, nic in (inv or {}).get("nics", {}).items():
+            for port, details in (nic.get("ports") or {"?": {}}).items():
+                speeds = [v for v in nic.get("speed_mbit", {}).values() if isinstance(v, (int, float)) and v > 0]
+                active = bool(re.search(r"\bACTIVE\b", details.get("state", ""))) and bool(speeds)
+                nics.append({"host": host, "device": name, "port": port, "model": nic.get("hca"), "firmware": nic.get("fw"),
+                    "state": details.get("state"), "rate": details.get("rate") if active else None, "rate_gbit": max(speeds) / 1000 if active else None, "raw_port_rate": details.get("rate"), "layer": details.get("link_layer"),
+                    "pcie": nic.get("pcie", {}).get("cur"), "adapter_pcie": nic.get("pcie", {}).get("max"),
+                    "numa": nic.get("pcie", {}).get("numa"), "ipv4": nic.get("ipv4", {}), "optics": nic.get("module", {})})
+    return {"drives": drives, "nics": nics}
+
+
+def traffic_terminal(traffic):
+    color = lambda status: f"{COL.get(status, '')}{status}{chr(27) + '[0m' if COL else ''}"
+    lines = ["OBSERVED / UNQUALIFIED — bandwidth is payload, latency is per batch", "",
+             "lane workload                 GB/s  Gb/s offeredGB/s offGb/s    obj/s workers seconds   bytes(GiB) objects status",
+             "─" * 135]
+    def number(value, spec=".2f"):
+        return "—" if value is None else format(value, spec)
+    for r in traffic:
+        values = [number(r[k], spec) for k, spec in (("gbps", ".2f"), ("gbits", ".1f"), ("offered_gbps", ".2f"),
+                  ("offered_gbits", ".1f"), ("objps", ".1f"), ("workers", ","), ("seconds", ".1f"))]
+        gib = r["bytes"] / 2**30 if r["bytes"] is not None else None
+        lines.append(f"{r['lane']:>4} {r['workload']:<23} " + " ".join(f"{v:>8}" for v in values) +
+                     f" {number(gib, '.3f'):>12} {number(r['objects'], ','):>8} {color(r['status'])} {r['detail']}")
+        lat = r['lat_ms']
+        lines.append("     batch ms " + " / ".join(f"{label} {number(lat.get(key))}" for key, label in (("p50", "p50"), ("p99", "p99"), ("p999", "p99.9"))) +
+                     "  " + "  ".join(f"{label} {number(r[key], ',')}" for key, label in (("misses", "misses"), ("errors", "errors"),
+                     ("mismatch", "mismatch"), ("deadline_refused", "final refused"), ("refusals", "refusal attempts"))))
+    if not traffic:
+        lines.append("No completed store measurements; this report cannot qualify throughput.")
+    return "\n".join(lines)
+
+
+def report_html(document):
+    """Offline, self-contained HTML; all captured values are escaped data."""
+    from html import escape
+    def text(value):
+        if value is None:
+            return "—"
+        if isinstance(value, float):
+            return f"{value:,.3f}"
+        if isinstance(value, int):
+            return f"{value:,}"
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, ensure_ascii=False)
+        return escape(str(value), quote=True)
+    def badge(status, label=None):
+        status = status if status in ("PASS", "WARN", "FAIL", "INFO", "SKIP") else "INFO"
+        displayed = status + " · " + label if label and label != status else status
+        return f'<span class="badge {status}">{text(displayed)}</span>'
+    def table(columns, records):
+        heads = ''.join(f'<th><button type="button">{text(label)}</button></th>' for key, label in columns)
+        lines = []
+        for record in records:
+            cells = []
+            for key, label in columns:
+                value = record.get(key)
+                shown = badge(record.get('status', 'INFO'), value) if key == 'status' else text(value)
+                if key == 'verdict':
+                    shown = badge(value)
+                cells.append(f'<td data-sort="{text(value)}">{shown}</td>')
+            lines.append('<tr>' + ''.join(cells) + '</tr>')
+        body = ''.join(lines) or f'<tr><td colspan="{len(columns)}">No captured measurements.</td></tr>'
+        return f'<div class="scroll"><table><thead><tr>{heads}</tr></thead><tbody>{body}</tbody></table></div>'
+    meta = document.get('meta', {})
+    traffic = document.get('traffic', [])
+    rows = document.get('rows', [])
+    cards = []
+    for prefix, label in (("put_sustained@", "Sustained PUT"), ("get_dram@", "Hot GET"), ("get_nvme", "L3 candidate GET"), ("mixed aggregate", "Mixed total")):
+        candidates = [r for r in traffic if r['workload'].startswith(prefix) and r['status'] != 'SKIP' and r['gbps'] is not None]
+        usable = [r for r in candidates if r['status'] != 'FAIL']
+        best = max(usable or candidates, key=lambda r: r['gbps']) if candidates else None
+        cards.append('<article class="metric"><div>' + label + '</div><strong>' +
+                     (text(best['gbps']) + '<small> GB/s</small>' if best else '—') + '</strong><p>' +
+                     (f"{text(best['gbits'])} Gb/s · lane {text(best['lane'])} · {text(best['workers'])} workers" if best else 'No captured measurement') +
+                     '</p>' + (badge(best['status'], best['detail'] + (f" · {best['misses']} misses; unqualified" if best['misses'] else '')) if best else badge('SKIP')) + '</article>')
+    header = ('<header><p class="eyebrow">MORPH · MOONCAKE STORE</p><h1>Storage traffic report</h1><p>' + text(meta.get('host', '?')) +
+    ' · ' + text(meta.get('started', '')) + ' · ' + text(meta.get('mode', '?')) + ' · ' + text(meta.get('profile', '?')) + '</p></header>')
+    sections = [header, '<main><aside class="banner"><b>OBSERVED / UNQUALIFIED</b><p>' +
+                text(document.get('qualification', 'Observed rates do not certify hardware peak or production fabric.')) +
+                '</p><p>Qualification failures and warnings do not automatically mean defective hardware. Unconnected optics may simply be uncabled; vendor claims are not measurements.</p><p>Payload throughput uses decimal GB/s and Gb/s. Batch latency uses ms. Refused work is excluded from successful bytes.</p></aside>',
+                '<div class="metrics">' + ''.join(cards) + '</div>']
+    counts = {v: sum(r.get('verdict') == v for r in rows) for v in ('PASS', 'WARN', 'FAIL', 'SKIP', 'INFO')}
+    sections.append('<p class="counts">Checks: ' + ' '.join(badge(v, str(counts[v])) for v in counts) +
+                    ' <span>Check outcomes do not certify transport qualification.</span></p>')
+    def workload_label(code):
+        kind, _, concurrency = code.partition("@")
+        label = {"put": "Initial fill PUT", "put_sustained": "Sustained PUT", "get_dram": "Hot candidate GET",
+                 "get_nvme": "L3 candidate GET", "mixed put": "Mixed PUT", "mixed get": "Mixed GET",
+                 "mixed aggregate": "Mixed aggregate"}.get(kind, code)
+        return label + (f" · {concurrency}w" if concurrency else "")
+    display_traffic = [{**r, "label": workload_label(r["workload"])} for r in traffic]
+    bandwidth = [('lane', 'Lane'), ('label', 'Workload / concurrency'), ('status', 'Status'), ('detail', 'Assessment'), ('gbps', 'Success GB/s'), ('gbits', 'Success Gb/s'),
+                 ('offered_gbps', 'Offered GB/s'), ('offered_gbits', 'Offered Gb/s'), ('objps', 'Objects/s'), ('workers', 'Workers'),
+                 ('seconds', 'Seconds'), ('bytes', 'Accepted bytes'), ('objects', 'Objects')]
+    sections.append('<section><h2>All PUT / GET measurements</h2><p>Every tested concurrency is shown. Mixed aggregate uses a shared window; its batch latency is not synthesized.</p>' + table(bandwidth, display_traffic))
+    latency = [{**r, **{k: r.get('lat_ms', {}).get(k) for k in ('p50', 'p99', 'p999')}} for r in display_traffic]
+    sections.append('<h3>Batch latency and outcomes</h3>' + table([('lane', 'Lane'), ('label', 'Workload'), ('status', 'Status'), ('p50', 'p50 ms'), ('p99', 'p99 ms'),
+        ('p999', 'p99.9 ms'), ('misses', 'Misses'), ('errors', 'Errors'), ('mismatch', 'Sample mismatches'), ('deadline_refused', 'Final deadline refusals'),
+        ('refusals', 'Refusal attempts')], latency) + '</section>')
+    hardware = document.get('hardware', {})
+    sections.append('<section><h2>Drives</h2><p>Click a column header to sort. Raw drive tests do not prove these drives back the selected L3 filesystem. — means not measured.</p>' +
+        table([('host', 'Host'), ('device', 'Drive'), ('model', 'Model'), ('capacity_gib', 'GiB'), ('firmware', 'Firmware'), ('numa', 'NUMA'),
+               ('pcie', 'Negotiated PCIe'), ('adapter_pcie', 'Adapter capability'), ('seqread_gbps', 'Sequential GB/s'), ('seqread_p99_ms', 'Sequential p99 ms'),
+               ('objread_gbps', 'Object GB/s'), ('objread_p99_ms', 'Object p99 ms'), ('seqread_errors', 'Sequential error'), ('objread_errors', 'Object error')], hardware.get('drives', [])) + '</section>')
+    def optics_summary(modules):
+        summary = []
+        for interface, module in modules.items():
+            if not module.get("present"):
+                summary.append(f"{interface}: optics not captured")
+                continue
+            temperature = fmt(module.get("temp_c"))
+            power = fmt(min(module["rx_dbm"]) if module.get("rx_dbm") else None)
+            alarms = "; ".join(module.get("alarms_on", [])) or "no captured alarms"
+            summary.append(f"{interface}: {temperature} °C; min RX {power} dBm; {alarms}")
+        return " | ".join(summary) or "not captured"
+    nic_display = [{**nic, "optics": optics_summary(nic.get("optics", {}))} for nic in hardware.get("nics", [])]
+    sections.append('<section><h2>NICs and optics</h2><p>Negotiated PCIe is compared with adapter capability; platform/slot capability is not measured. Firmware impact is unproven.</p>' +
+        table([('host', 'Host'), ('device', 'NIC'), ('port', 'Port'), ('model', 'Model'), ('firmware', 'Firmware'), ('state', 'Link state'), ('rate', 'Active captured rate'),
+               ('layer', 'Link layer'), ('pcie', 'Negotiated PCIe'), ('adapter_pcie', 'Adapter capability'), ('numa', 'NUMA'), ('ipv4', 'IPv4'), ('optics', 'Optics / alarms / °C / dBm')], nic_display) + '</section>')
+    sections.append('<section><h2>Checks and evidence</h2>')
+    groups = {}
+    for row in rows:
+        groups.setdefault(row.get('section', 'Other'), []).append(row)
+    for group, checks in groups.items():
+        failures = sum(c.get('verdict') == 'FAIL' for c in checks)
+        warnings = sum(c.get('verdict') == 'WARN' for c in checks)
+        sections.append(f'<details{" open" if failures else ""}><summary>{text(group)} <span>{len(checks)} checks · {failures} fail · {warnings} warn</span></summary>' +
+                        table([('verdict', 'Result'), ('check', 'Check'), ('measured', 'Measured'), ('bar', 'Reference'), ('detail', 'Evidence')], checks) + '</details>')
+    sections.append('</section><section><h2>Bottlenecks and findings</h2>')
+    for finding in document.get('bottlenecks', []):
+        sections.append('<details open><summary>' + text(finding.get('phase')) + '</summary><p>' + text(finding.get('verdict')) + '</p>' +
+            table([('resource', 'Resource'), ('score', 'Utilization ratio'), ('evidence', 'Evidence')], finding.get('top', [])) +
+            '<ul>' + ''.join('<li>' + text(f) + '</li>' for f in finding.get('facts', [])) + '</ul></details>')
+    sections.append('<ul>' + ''.join('<li>' + text(note) + '</li>' for note in document.get('notes', [])) + '</ul></section></main>')
+    css = '''
+:root{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;color:#142238;background:#edf2f7;font-variant-numeric:tabular-nums;line-height:1.5}*{box-sizing:border-box}body{margin:0}header{background:#10243b;color:white;padding:34px max(24px,calc((100vw - 1500px)/2));border-bottom:5px solid #32b8c5}h1{font-size:34px;margin:6px 0}header p{margin:4px 0;color:#c7d5e5}.eyebrow{font-size:12px;letter-spacing:.15em;font-weight:700}main{min-width:0;max-width:1550px;margin:auto;padding:24px}.banner{background:#fff5d6;border-left:5px solid #bd8315;border-radius:8px;padding:18px 22px}.banner p{margin:6px 0;font-size:14px}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin:22px 0}.metric{min-width:0;background:white;border:1px solid #d9e2ed;border-radius:12px;padding:20px;box-shadow:0 3px 9px #172b4d08}.metric .badge{white-space:normal;overflow-wrap:anywhere}.metric>div{color:#53677e;font-size:13px;font-weight:700}.metric strong{font-size:34px;display:block}.metric small{font-size:15px;font-weight:500}.metric p{font-size:12px;color:#53677e}.badge{display:inline-block;font-size:11px;font-weight:750;border-radius:5px;padding:3px 7px;white-space:nowrap}.PASS{background:#def5e8;color:#086839}.WARN{background:#fff0c2;color:#805600}.FAIL{background:#ffe0df;color:#a32020}.INFO{background:#deedff;color:#155a9d}.SKIP{background:#e8edf2;color:#617084}.counts{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.counts>span{font-size:12px;color:#617084}section{min-width:0;background:white;border:1px solid #d9e2ed;border-radius:12px;margin:20px 0;padding:22px}h2{font-size:21px;margin:0 0 8px}h3{font-size:16px;margin:24px 0 10px}section>p{font-size:13px;color:#52647b}.scroll{overflow:auto;max-width:100%;border:1px solid #d9e2ed;border-radius:7px}table{border-collapse:collapse;width:100%;font-size:12px}thead{background:#edf3fa}th,td{padding:10px 12px;border-bottom:1px solid #e5eaf0;text-align:left;vertical-align:top}th{white-space:normal;min-width:90px;font-size:11px;color:#40536b}td{white-space:nowrap}td:last-child{white-space:normal;min-width:160px}tbody tr:nth-child(even){background:#f8fafc}tbody tr:hover{background:#ecf5ff}th button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer;text-align:left}th button:after{content:' ↕';color:#8a9bb0}details{margin:12px 0;border:1px solid #d9e2ed;border-radius:8px;padding:12px}summary{cursor:pointer;font-weight:650;font-size:13px}summary span{font-weight:400;font-size:12px;color:#617084;margin-left:12px}details .scroll{margin-top:12px}li{font-size:13px;overflow-wrap:anywhere}@media(max-width:900px){.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}main{padding:12px}section{padding:14px}header{padding:24px}.metric strong{font-size:28px}}@media(max-width:500px){.metrics{grid-template-columns:1fr}h1{font-size:27px}}@media print{@page{size:landscape;margin:10mm}body{background:white;color:black}header{background:white;color:black;padding:0 0 12px;border-bottom:2px solid #333}header p{color:#333}main{max-width:none;padding:0}.metrics{gap:8px}.metric,section{box-shadow:none;break-inside:avoid;padding:10px;margin:10px 0}.scroll{overflow:visible}table{font-size:8px;width:100%;table-layout:fixed}th,td{min-width:0!important;white-space:normal!important;word-break:break-word;padding:4px}details{break-inside:auto}.badge{font-size:8px;padding:2px}th button:after{content:''}.banner{padding:10px}.metric strong{font-size:23px}}
+'''
+    js = '''
+document.querySelectorAll('th button').forEach(button=>button.addEventListener('click',()=>{const th=button.parentElement,table=th.closest('table'),body=table.tBodies[0],index=th.cellIndex,asc=th.dataset.order!=='asc';table.querySelectorAll('th').forEach(h=>{delete h.dataset.order;h.removeAttribute('aria-sort')});th.dataset.order=asc?'asc':'desc';th.setAttribute('aria-sort',asc?'ascending':'descending');const rows=Array.from(body.rows);rows.sort((a,b)=>{const x=a.cells[index].dataset.sort,y=b.cells[index].dataset.sort,n=v=>Number(v.replaceAll(',','')),numeric=x!=='—'&&y!=='—'&&x.trim()!==''&&y.trim()!==''&&Number.isFinite(n(x))&&Number.isFinite(n(y));return(asc?1:-1)*(numeric?n(x)-n(y):x.localeCompare(y,undefined,{numeric:true}))});rows.forEach(row=>body.appendChild(row))}));window.addEventListener('beforeprint',()=>document.querySelectorAll('details').forEach(d=>{d.dataset.wasOpen=d.open?'1':'0';d.open=true}));window.addEventListener('afterprint',()=>document.querySelectorAll('details').forEach(d=>{d.open=d.dataset.wasOpen==='1'}));
+'''
+    return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Mooncake traffic report</title><style>' + css + '</style></head><body>' + ''.join(sections) + '<script>' + js + '</script></body></html>'
 
 
 # ── rendering ───────────────────────────────────────────────────────────────────────────────
@@ -2577,7 +2803,7 @@ finish_report() {
   MCL_LENIENT=$LENIENT "$PY" "$LIB/report.py" "$RUN" || rc=$?
   tar -C "$(dirname "$RUN")" -czf "$RUN.tar.gz" "$(basename "$RUN")" 2>/dev/null || true
   echo
-  log "report: $RUN/report.txt   data: $RUN.tar.gz"
+  log "report: $RUN/report.html   text: $RUN/report.txt   data: $RUN.tar.gz"
   return $rc
 }
 
@@ -2647,6 +2873,8 @@ main() {
   [ "$(uname -s)" = Linux ] || die "Linux only"
   if [ "$MODE" = report ]; then
     [ -x "$PY" ] || die "no $PY: run a test first"
+    mkdir -p "$LIB"
+    write_payload
     MCL_LENIENT=$LENIENT "$PY" "$LIB/report.py" "$REPORT_DIR"; exit $?
   fi
   [ "$(id -u)" = 0 ] || die "run as root (sudo): installs packages, pins memory for RDMA, reads SMART/AER/EDAC counters"

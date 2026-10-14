@@ -185,9 +185,11 @@ class RunnerTests(unittest.TestCase):
             completed = subprocess.run([sys.executable, str(Path(PAYLOAD.name) / 'lib/report.py'), directory],
                                        capture_output=True, text=True)
             self.assertIn(completed.returncode, (0, 1), completed.stderr)
-            report = Path(directory, 'report.txt').read_text()
-            self.assertIn('Observed payload bandwidth', report)
-            self.assertTrue(Path(directory, 'report.json').exists())
+            document = json.loads(Path(directory, 'report.json').read_text())
+            self.assertEqual(document['traffic'], [])
+            inventory = next(row for row in document['rows'] if row['check'] == 'server inventory')
+            self.assertEqual(inventory['verdict'], 'FAIL')
+            self.assertEqual(completed.returncode, 1)
 
 
 if __name__ == '__main__': unittest.main()

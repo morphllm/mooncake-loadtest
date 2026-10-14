@@ -52,11 +52,11 @@ The detailed report compares actual fabric, memory and filesystem ceilings, samp
 # Smaller report-oriented run; skips separate hardware ceiling tests.
 curl -fsSL https://raw.githubusercontent.com/morphllm/mooncake-loadtest/main/mooncake-loadtest.sh | sudo bash -s -- single --segment-gb 4 --disk-cap-gb 16 --workers 8 --skip fabric,dram,nvme,fs
 
-# Render an existing report again.
+# Re-render captured evidence without rerunning the benchmark; preserve prior report files first.
 sudo bash mooncake-loadtest.sh report /opt/mooncake-loadtest/runs/RUN
 ```
 
-Every run writes `report.txt`, `report.json`, raw samples, configuration, logs and an adjacent `.tar.gz`. The compact traffic table appears first. Completed phases also save `client/bench.json.partial.jsonl`; worker exits and phase timeouts produce a failed report rather than waiting forever. Exit status: 0 no failed checks; 1 failed checks; 2 setup failure. A skipped store phase cannot certify performance.
+Every run writes an offline `report.html`, plain `report.txt`, structured `report.json`, raw samples, configuration, logs and an adjacent `.tar.gz`. The HTML report shows summary metrics, every PUT/GET concurrency, mixed directions and their shared-window aggregate, batch latency, outcomes, sortable drives/NICs, and collapsible checks. It needs no network, CDN, or assets. Capacity refusals are amber; invalid samples remain visible with their measured rates. Check failures do not automatically diagnose defective hardware. Terminal tables use colors on a TTY unless `NO_COLOR` is set; saved text always stays plain. Missing evidence appears as a dash, not a measured zero. Completed phases also save `client/bench.json.partial.jsonl`; worker exits and phase timeouts produce a failed report rather than waiting forever. Exit status: 0 no failed checks; 1 failed checks; 2 setup failure. A skipped store phase cannot certify performance.
 
 ## Development
 
@@ -80,4 +80,4 @@ shellcheck -S error mooncake-loadtest.sh
 python -m unittest discover -s tests -v
 ```
 
-Unit checks cover actual put/get memory transfers, successful-byte accounting, misses, deadline-bounded refusals, incomplete responses, shared mixed windows, dead workers, scoped process cleanup, rolling accepted-key reads, managed runtime reuse, real fio job parsing and read-only enforcement, and report rendering. Real RDMA/L3 hardware qualification is a separate server run; unit tests cannot establish its throughput.
+Unit checks cover actual put/get memory transfers, successful-byte accounting, misses, deadline-bounded refusals, incomplete responses, shared mixed windows, dead workers, scoped process cleanup, rolling accepted-key reads, managed runtime reuse, real fio job parsing/read-only enforcement, HTML escaping, numeric report units, shared mixed windows, and report rendering with `NO_COLOR`. Real RDMA/L3 hardware qualification is a separate server run; unit tests cannot establish its throughput.

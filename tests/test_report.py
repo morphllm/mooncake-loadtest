@@ -1,0 +1,253 @@
+import errno
+import importlib.util
+import json
+import os
+from pathlib import Path
+import pty
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def sample(**changes):
+    result = {
+        'gbps': 2.5, 'offered_gbps': 3.0, 'bytes': 25_000_000_000,
+        'objs': 1000, 'seconds': 10, 'workers': 4, 'window': [100, 110],
+        'lat_ms': {'p50': 1.5, 'p99': 4.0, 'p999': 8.0},
+        'misses': 0, 'errors': {}, 'mismatch': 0,
+        'deadline_refused': 0, 'refusals': 0, **changes,
+    }
+    if 'bytes' not in changes:
+        result['bytes'] = int(result['gbps'] * result['seconds'] * 1e9)
+    if 'objs' not in changes:
+        result['objs'] = result['bytes'] // 25_000_000
+    return result
+
+
+def benchmark():
+    return {
+        'config': {'lanes': [{'idx': 0}], 'object_bytes': 25_000_000},
+        'phases': {
+            'put_sustained@1': {'0': sample(gbps=1.0, workers=1)},
+            'put_sustained@4': {'0': sample(deadline_refused=2, refusals=12)},
+            'get_dram@1': {'0': sample(gbps=1.75, workers=1)},
+            'get_dram@4': {'0': sample(gbps=4.0)},
+            'get_nvme': {'0': sample(misses=3)},
+            'mixed': {'0': {'put': sample(gbps=1.25), 'get': sample(gbps=2.0)}},
+        },
+    }
+
+
+class ReportTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.payload = tempfile.TemporaryDirectory()
+        subprocess.run(
+            ['bash', '-c', 'source "$1"; mkdir -p "$LIB"; write_payload',
+             'test', str(ROOT / 'mooncake-loadtest.sh')],
+            env={**os.environ, 'MCL_WORK': cls.payload.name}, check=True,
+        )
+        cls.script = Path(cls.payload.name, 'lib/report.py')
+        spec = importlib.util.spec_from_file_location('report_under_test', cls.script)
+        cls.report = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.report)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.payload.cleanup()
+
+    def test_traffic_preserves_numeric_measurements_and_latency(self):
+        rows = self.report.traffic_rows(benchmark())
+        row = next(r for r in rows if r['workload'] == 'get_dram@4')
+        self.assertEqual(row['gbps'], 4.0)
+        self.assertEqual(row['gbits'], 32.0)
+        self.assertEqual(row['objps'], 160.0)
+        self.assertEqual(row['lat_ms']['p99'], 4.0)
+        self.assertEqual(row['status'], 'INFO')
+        decoded = json.loads(json.dumps(rows))
+        self.assertIsInstance(decoded[0]['gbps'], (int, float))
+        self.assertIsInstance(decoded[0]['seconds'], (int, float))
+
+    def test_capacity_refusals_are_amber_without_becoming_errors(self):
+        rows = self.report.traffic_rows(benchmark())
+        row = next(r for r in rows if r['workload'] == 'put_sustained@4')
+        self.assertEqual(row['status'], 'WARN')
+        self.assertEqual(row['detail'], 'capacity limited')
+        self.assertEqual(row['deadline_refused'], 2)
+        self.assertEqual(row['errors'], 0)
+        self.assertEqual(row['bytes'], 25_000_000_000)
+
+    def test_misses_corruption_and_zero_payload_are_invalid(self):
+        for changes in ({'misses': 1}, {'mismatch': 1}, {'errors': {'-800': 2}},
+                        {'bytes': 0, 'gbps': 0, 'objs': 0}):
+            with self.subTest(changes=changes):
+                bench = {'config': {'lanes': [{'idx': 0}]},
+                         'phases': {'get_nvme': {'0': sample(**changes)}}}
+                row, = self.report.traffic_rows(bench)
+                self.assertEqual(row['status'], 'FAIL')
+                self.assertEqual(row['detail'], 'invalid/errorful')
+
+    def test_mixed_rows_keep_direction_rates_and_aggregate(self):
+        rows = self.report.traffic_rows(benchmark())
+        mixed = {r['workload']: r for r in rows if r['workload'].startswith('mixed')}
+        self.assertEqual(mixed['mixed put']['gbps'], 1.25)
+        self.assertEqual(mixed['mixed get']['gbps'], 2.0)
+        self.assertEqual(mixed['mixed aggregate']['gbps'], 3.25)
+        self.assertEqual(mixed['mixed aggregate']['seconds'], 10)
+
+    def test_mismatched_mixed_windows_do_not_fabricate_an_aggregate(self):
+        bench = {'config': {'lanes': [{'idx': 0}]}, 'phases': {'mixed': {'0': {
+            'put': sample(window=[100, 110]), 'get': sample(window=[101, 111]),
+        }}}}
+        rows = self.report.traffic_rows(bench)
+        aggregate = next(r for r in rows if r['workload'] == 'mixed aggregate')
+        self.assertEqual(aggregate['status'], 'FAIL')
+        self.assertIsNone(aggregate['gbps'])
+
+    def test_missing_or_zero_measurement_time_cannot_be_clean(self):
+        for seconds in (None, 0):
+            with self.subTest(seconds=seconds):
+                bench = {'config': {'lanes': [{'idx': 0}]}, 'phases': {
+                    'get_dram@1': {'0': sample(seconds=seconds, bytes=25_000_000_000)},
+                }}
+                row, = self.report.traffic_rows(bench)
+                self.assertEqual(row['status'], 'FAIL')
+
+    def test_missing_evidence_creates_no_measurements(self):
+        self.assertEqual(self.report.traffic_rows(None), [])
+        self.assertEqual(self.report.traffic_rows({'phases': {}}), [])
+        with tempfile.TemporaryDirectory() as directory:
+            hardware = self.report.hardware_rows({}, Path(directory))
+        self.assertEqual(hardware['drives'], [])
+        self.assertEqual(hardware['nics'], [])
+        page = self.report.report_html({'traffic': [], 'hardware': hardware})
+        self.assertIn('<html', page.lower())
+        self.assertNotIn('NaN', page)
+
+    def test_hardware_uses_fio_measurements_and_keeps_missing_rates_unknown(self):
+        inventory = {
+            'nvme': {'nvme0n1': {'model': 'Synthetic drive', 'serial': 'TEST-ONLY',
+                                'fw': 'test-fw', 'bytes': 100_000_000_000,
+                                'pcie': {'cur': '16.0 x4', 'max': '16.0 x4', 'numa': 0},
+                                'smart': {'temperature': 303, 'percent_used': 0}}},
+            'nics': {'mlx5_0': {'hca': 'Synthetic NIC', 'fw': 'test-fw',
+                                'pcie': {'cur': '16.0 x16', 'numa': 0},
+                                'ports': {'1': {'rate': '200 Gb/sec', 'state': 'ACTIVE'}},
+                                'ipv4': {'eth0': '192.0.2.10'},
+                                'speed_mbit': {'eth0': 200000}}},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory, 'nvme')
+            data.mkdir()
+            (data / 'raw-seqread.json').write_text(json.dumps({'jobs': [{
+                'jobname': 'nvme0n1', 'error': 0,
+                'read': {'bw_bytes': 2_500_000_000, 'iops': 2500,
+                         'clat_ns': {'percentile': {'99.000000': 2_000_000}}},
+            }]}))
+            hardware = self.report.hardware_rows(inventory, Path(directory))
+        drive, = hardware['drives']
+        self.assertEqual(drive['seqread_gbps'], 2.5)
+        self.assertEqual(drive['seqread_p99_ms'], 2.0)
+        self.assertIsNone(drive['objread_gbps'])
+        nic, = hardware['nics']
+        self.assertEqual(nic['rate'], '200 Gb/sec')
+
+    def test_inactive_or_unmeasured_nic_rate_remains_unknown(self):
+        for state, speed in (('DOWN', 200000), ('ACTIVE', None), ('ACTIVE', 0)):
+            with self.subTest(state=state, speed=speed):
+                inventory = {'nics': {'mlx5_0': {
+                    'ports': {'1': {'rate': '400 Gb/sec', 'state': state}},
+                    'speed_mbit': {} if speed is None else {'eth0': speed},
+                }}}
+                with tempfile.TemporaryDirectory() as directory:
+                    hardware = self.report.hardware_rows(inventory, Path(directory))
+                nic, = hardware['nics']
+                self.assertIsNone(nic['rate'])
+                self.assertIsNone(nic['rate_gbit'])
+                self.assertEqual(nic['raw_port_rate'], '400 Gb/sec')
+
+    def test_html_escapes_untrusted_host_checks_and_notes(self):
+        attack = '<img src=x onerror="alert(1)">'
+        document = {
+            'meta': {'host': attack}, 'qualification': attack,
+            'traffic': self.report.traffic_rows(benchmark()),
+            'hardware': {'drives': [], 'nics': []},
+            'rows': [{'section': attack, 'check': attack, 'measured': attack,
+                      'bar': attack, 'verdict': 'FAIL', 'detail': attack}],
+            'bottlenecks': [], 'notes': [attack],
+        }
+        page = self.report.report_html(document)
+        self.assertNotIn(attack, page)
+        self.assertIn('&lt;img', page)
+        self.assertIn('Hot candidate GET', page)
+        self.assertIn('Mixed aggregate', page)
+
+    def test_minimal_run_writes_html_json_and_plain_terminal_with_no_color(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            (run / 'server').mkdir()
+            (run / 'client').mkdir()
+            (run / 'meta.json').write_text(json.dumps({'mode': 'single', 'host': 'synthetic'}))
+            master, slave = pty.openpty()
+            try:
+                process = subprocess.Popen(
+                    [sys.executable, str(self.script), str(run)], stdout=slave,
+                    stderr=subprocess.PIPE, env={**os.environ, 'NO_COLOR': '1'},
+                )
+                os.close(slave)
+                slave = None
+                terminal = bytearray()
+                while True:
+                    try:
+                        chunk = os.read(master, 65536)
+                    except OSError as exc:
+                        if exc.errno == errno.EIO:
+                            break
+                        raise
+                    if not chunk:
+                        break
+                    terminal.extend(chunk)
+                _, stderr = process.communicate(timeout=10)
+                self.assertIn(process.returncode, (0, 1), stderr.decode())
+            finally:
+                os.close(master)
+                if slave is not None:
+                    os.close(slave)
+            self.assertNotIn(b'\x1b[', terminal)
+            document = json.loads((run / 'report.json').read_text())
+            self.assertEqual(document['traffic'], [])
+            self.assertIn('hardware', document)
+            self.assertIn('qualification', document)
+            self.assertIn('<html', (run / 'report.html').read_text().lower())
+            self.assertNotIn('\x1b[', (run / 'report.txt').read_text())
+
+    def test_report_mode_refreshes_an_installed_older_renderer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            interpreter = work / 'venv/bin/python'
+            interpreter.parent.mkdir(parents=True)
+            interpreter.symlink_to(sys.executable)
+            (work / 'lib').mkdir()
+            (work / 'lib/report.py').write_text('import sys\nsys.exit(77)\n')
+            run = work / 'run'
+            (run / 'server').mkdir(parents=True)
+            (run / 'client').mkdir()
+            (run / 'meta.json').write_text(json.dumps({'mode': 'single', 'host': 'synthetic'}))
+            completed = subprocess.run(
+                ['bash', '-c', 'source "$1"; uname() { echo Linux; }; main report "$2"',
+                 'test', str(ROOT / 'mooncake-loadtest.sh'), str(run)],
+                env={**os.environ, 'MCL_WORK': directory, 'NO_COLOR': '1'},
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            self.assertTrue((run / 'report.html').is_file())
+            document = json.loads((run / 'report.json').read_text())
+            self.assertEqual(document['traffic'], [])
+
+
+if __name__ == '__main__':
+    unittest.main()
