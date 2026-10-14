@@ -494,7 +494,7 @@ def ethtool_stats(nd):
 
 
 def cmd_snapshot(a):
-    s = {"t": time.time(), "aer": {}, "link": {}, "edac": {}, "rdma": {}, "ethtool": {}, "module": {}, "nvme": {}, "throttle": {}, "dmesg": []}
+    s = {"t": time.time(), "aer": {}, "link": {}, "edac": {}, "rdma": {}, "ethtool": {}, "module": {}, "nvme": {}, "nvme_selftest": {}, "throttle": {}, "dmesg": []}
     for d in glob.glob("/sys/bus/pci/devices/*"):
         rec = {k: parse_kv_file(f"{d}/aer_dev_{k}") for k in ("correctable", "nonfatal", "fatal") if os.path.exists(f"{d}/aer_dev_{k}")}
         for k in ("aer_rootport_total_err_cor", "aer_rootport_total_err_fatal", "aer_rootport_total_err_nonfatal"):
@@ -523,6 +523,7 @@ def cmd_snapshot(a):
             continue
         sm = jsonish(f"nvme smart-log -o json /dev/{c}")
         s["nvme"][c] = {k: v for k, v in sm.items() if isinstance(v, (int, float))}
+        s["nvme_selftest"][c] = jsonish(f"nvme self-test-log -o json /dev/{c}")
         s["link"][c] = pcie_link(nvme_sysdev(ns))["cur"]
     for mc in glob.glob("/sys/devices/system/edac/mc/mc*"):
         rec = {k: num(rd(f"{mc}/{k}")) for k in ("ce_count", "ue_count", "ce_noinfo_count", "ue_noinfo_count") if os.path.exists(f"{mc}/{k}")}
@@ -1681,7 +1682,7 @@ def main(run):
     document = {"meta": meta, "qualification": qualification, "traffic": traffic,
                 "hardware": hardware_rows(inv, S), "rows": rows,
                 "bottlenecks": [{"phase": p, **b} for p, b in bottlenecks], "notes": notes, "thresholds": TH}
-    out = traffic_terminal(traffic) + "\n\n" + render(run, meta, info)
+    out = traffic_terminal(traffic) + "\n\n" + render(run, meta, info) + "\n" + drive_health_terminal(document["hardware"]["drives"])
     (run / "report.txt").write_text(re.sub(r"\033\[[0-9;]*m", "", out))
     (run / "report.html").write_text(report_html(document))
     with open(run / "report.json", "w") as f:
@@ -1842,6 +1843,130 @@ CORR_PAT = re.compile(r"(corrected|err_lane_\d+|fec_corr)", re.I)
 BENIGN = re.compile(r"^(rx|tx|ch)\d+_|_cache_|xdp|^rx_vport|^tx_vport|lro|csum|tso|gso|_wake|_stopped|_nop|dropped_xdp|_arfs|tls|ptp|_xsk|_wqe_err$", re.I)
 
 
+def self_test_health(log):
+    """Interpret the last recorded log only; never start or resume a self-test."""
+    log = log or {}
+    operation = log.get("Current Device Self-Test Operation", log.get("current_operation"))
+    reports = log.get("List of Valid Reports", log.get("valid_reports", []))
+    record = reports[0] if reports else log
+    result = record.get("Self test result", record.get("result"))
+    labels = {0: "completed without reported fault", 1: "aborted by command", 2: "aborted by controller reset", 3: "aborted by namespace removal",
+              4: "aborted by format", 5: "fatal or unknown test failure", 6: "test failure; segment unknown", 7: "test failure; segment recorded",
+              8: "aborted for unknown reason", 9: "aborted by sanitize", 15: "unused / not run"}
+    status, label = "SKIP", "UNKNOWN — no recorded self-test result"
+    if operation not in (None, 0):
+        status, label = "WARN", "self-test in progress; not a completed pass"
+    elif result == 0 and operation == 0:
+        status, label = "PASS", "last recorded self-test completed without reported fault"
+    elif result in (5, 6, 7):
+        status, label = "FAIL", "last recorded " + labels[result] + "; inspect historical log context"
+    elif result not in (None, 15):
+        status, label = "WARN", labels.get(result, "unrecognized self-test result; inspect log")
+    return {"self_test_current_operation": operation, "self_test_result": result, "self_test_status": status, "self_test_label": label}
+
+
+def smart_health(before, after, selftest=None):
+    """One SMART policy shared by diagnostics and the visible drive-health tables."""
+    before, after = before or {}, after or {}
+    def value(snapshot, key):
+        item = snapshot.get(key)
+        if isinstance(item, str):
+            try: return int(item, 0)
+            except ValueError:
+                try: return int(item)
+                except ValueError: return None
+        return item if isinstance(item, (int, float)) else None
+    issues = []
+    def issue(check, measured, verdict, detail=""):
+        issues.append({"check": check, "measured": measured, "verdict": verdict, "detail": detail})
+    def delta(key):
+        previous, current = value(before, key), value(after, key)
+        if previous is None or current is None:
+            return None
+        if current < previous:
+            issue(key + " counter regression", f"{previous} → {current}", "WARN", "comparison invalid; no zero delta inferred")
+            return None
+        return current - previous
+    keys = ("media_errors", "num_err_log_entries", "unsafe_shutdowns", "warning_temp_time", "critical_comp_time", "power_on_hours")
+    diffs = {key: delta(key) for key in keys}
+    for key, label, verdict in (("media_errors", "media/data integrity errors", "FAIL"),
+        ("num_err_log_entries", "error-log entries", strict("x")), ("unsafe_shutdowns", "unsafe shutdowns", "FAIL"),
+        ("warning_temp_time", "minutes above warning temp", "FAIL"), ("critical_comp_time", "minutes above critical temp", "FAIL")):
+        if diffs[key] is not None and diffs[key] > 0:
+            detail = "inspect error status codes; entries may be administrative and do not prove a media fault" if key == "num_err_log_entries" else ""
+            issue(label, f"+{diffs[key]}", verdict, detail)
+    critical = value(after, "critical_warning")
+    flags = ("spare below threshold", "temperature outside threshold", "subsystem reliability degraded", "media read-only",
+             "volatile memory backup failure", "persistent memory region read-only")
+    decoded = [label for bit, label in enumerate(flags) if critical is not None and int(critical) & (1 << bit)]
+    if critical is not None and int(critical) & ~0x3f:
+        decoded.append("unknown/reserved warning bits")
+    if critical:
+        issue("critical_warning", f"0x{int(critical):02x}", "FAIL", "; ".join(decoded))
+    spare, threshold = value(after, "avail_spare"), value(after, "spare_thresh")
+    if spare is not None and threshold is not None and spare <= threshold:
+        issue("available spare at/below threshold", f"{spare}% <= {threshold}%", "FAIL")
+    wear = value(after, "percent_used")
+    if wear is not None and wear >= TH["percent_used_warn"]:
+        issue("endurance used", f"{wear}%", "WARN")
+    media = value(after, "media_errors")
+    if media and diffs["media_errors"] in (0, None):
+        issue("media errors since manufacture", media, "WARN", "historical media errors; missing baseline cannot establish when they occurred")
+    temperature = value(after, "temperature")
+    temperature = temperature - 273.15 if temperature is not None and temperature > 200 else temperature
+    if temperature is not None and temperature >= TH["nvme_temp_warn_c"]:
+        issue("composite temperature at end", f"{temperature:.1f} C", "WARN")
+    thermal = {key: delta(key) for key in after if re.match(r"thm_temp\d_(total_time|trans_count)$", key)}
+    seconds = sum(v for k, v in thermal.items() if k.endswith("total_time") and v is not None)
+    transitions = sum(v for k, v in thermal.items() if k.endswith("trans_count") and v is not None)
+    if seconds or transitions:
+        issue("thermal throttling", f"+{seconds} s, +{transitions} transitions", "FAIL")
+    required = keys + ("critical_warning", "percent_used", "avail_spare", "spare_thresh", "temperature")
+    missing = [key for key in required if value(after, key) is None]
+    missing += ["baseline " + key for key in keys if value(before, key) is None]
+    if missing:
+        issue("SMART coverage", ", ".join(missing), "SKIP", "UNKNOWN: incomplete measurements; no green health verdict")
+    test = self_test_health(selftest)
+    if test["self_test_status"] in ("WARN", "FAIL"):
+        issue("last recorded self-test", test["self_test_result"], test["self_test_status"], test["self_test_label"])
+    rank = {"PASS": 0, "SKIP": 1, "WARN": 2, "FAIL": 3}
+    status = max((item["verdict"] for item in issues), key=rank.get, default="PASS")
+    label = {"PASS": "no SMART fault detected", "SKIP": "UNKNOWN — SMART coverage incomplete", "WARN": "SMART warning — inspect evidence", "FAIL": "fault or diagnostic finding — inspect evidence"}[status]
+    evidence = "; ".join(f"{i['check']}: {i['measured']}" + (f" ({i['detail']})" if i['detail'] else "") for i in issues)
+    if value(after, "num_err_log_entries"):
+        evidence += "; historical error-log entries require status-code inspection; not proof of media failure"
+    return {**test, "health_status": status, "health_label": label, "health_evidence": evidence.strip("; "), "issues": issues,
+        "critical_warning": critical, "critical_warning_hex": f"0x{int(critical):02x}" if critical is not None else None,
+        "critical_warning_decoded": decoded, "media_errors": media, "media_errors_delta": diffs["media_errors"],
+        "error_log_entries": value(after, "num_err_log_entries"), "error_log_delta": diffs["num_err_log_entries"],
+        "wear_percent": wear, "spare_percent": spare, "spare_threshold": threshold, "temperature_c": temperature,
+        "power_on_hours": value(after, "power_on_hours"), "unsafe_shutdowns": value(after, "unsafe_shutdowns"),
+        "unsafe_shutdowns_delta": diffs["unsafe_shutdowns"], "warning_temp_time_delta": diffs["warning_temp_time"],
+        "critical_comp_time_delta": diffs["critical_comp_time"], "thermal_seconds_delta": seconds if thermal and all(v is not None for v in thermal.values()) else None,
+        "thermal_transitions_delta": transitions if thermal and all(v is not None for v in thermal.values()) else None}
+
+
+def drive_health_terminal(drives):
+    lines = ["", "DRIVE HEALTH — read-only SMART evidence; not readiness to ship or full media qualification", "",
+             "host drive      serial                 health                         critical media(life/Δ) errors(life/Δ) wear spare/limit temp°C hours unsafe(life/Δ)"]
+    def show(value): return "—" if value is None else str(value)
+    for drive in drives:
+        status = drive["health_status"]
+        colored = f"{COL.get(status, '')}{status}{chr(27) + '[0m' if COL else ''}"
+        pairs = [show(drive[k]) + "/" + show(drive[d]) for k, d in (("media_errors", "media_errors_delta"), ("error_log_entries", "error_log_delta"), ("unsafe_shutdowns", "unsafe_shutdowns_delta"))]
+        lines.append(f"{drive['host']:<6} {drive['device']:<10} {show(drive['serial']):<22} {colored} {drive['health_label']}  " +
+            "  ".join((show(drive['critical_warning_hex']), pairs[0], pairs[1], show(drive['wear_percent']),
+            show(drive['spare_percent']) + "/" + show(drive['spare_threshold']), show(drive['temperature_c']), show(drive['power_on_hours']), pairs[2])))
+        lines.append("       thermal minutes Δ warning/critical " + show(drive['warning_temp_time_delta']) + "/" + show(drive['critical_comp_time_delta']) +
+                     "; throttle seconds/transitions Δ " + show(drive['thermal_seconds_delta']) + "/" + show(drive['thermal_transitions_delta']))
+        lines.append("       recorded self-test " + drive["self_test_status"] + ": " + drive["self_test_label"] + "; result " + show(drive["self_test_result"]))
+        if drive['health_evidence']:
+            lines.append("       " + drive['health_evidence'])
+    if not drives:
+        lines.append("UNKNOWN — no captured drive inventory / SMART evidence.")
+    return "\n".join(lines)
+
+
 def errors_section(h, b, a, inv, ser, W):
     sec = f"errors: {h}"
     if not a:
@@ -1910,44 +2035,13 @@ def errors_section(h, b, a, inv, ser, W):
             "load the platform EDAC module (e.g. amd64_edac / skx_edac / i10nm_edac) or check the BMC SEL")
     elif not ec_moved:
         add(sec, "memory ECC (EDAC CE + UE)", "0 new", "0", "PASS")
-    # NVMe SMART / error log
-    for c, s in a.get("nvme", {}).items():
-        p = b.get("nvme", {}).get(c, {})
-        dd = lambda k: (s.get(k) or 0) - (p.get(k) or 0)
-        bad = []
-        if dd("media_errors") > 0:
-            bad.append(("media/data integrity errors", f"+{dd('media_errors')}", "FAIL"))
-        if dd("num_err_log_entries") > 0:
-            bad.append(("error-log entries", f"+{dd('num_err_log_entries')}", strict("x")))
-        if s.get("critical_warning"):
-            bad.append(("critical_warning", s["critical_warning"], "FAIL"))
-        if dd("warning_temp_time") > 0:
-            bad.append(("minutes above warning temp", f"+{dd('warning_temp_time')}", "FAIL"))
-        if dd("critical_comp_time") > 0:
-            bad.append(("minutes above critical temp", f"+{dd('critical_comp_time')}", "FAIL"))
-        thr = sum(dd(k) for k in s if re.match(r"thm_temp\d_total_time", k))
-        trn = sum(dd(k) for k in s if re.match(r"thm_temp\d_trans_count", k))
-        if thr > 0 or trn > 0:
-            bad.append(("thermal throttling", f"+{thr} s, +{trn} transitions", "FAIL"))
-        if dd("unsafe_shutdowns") > 0:
-            bad.append(("unsafe shutdowns", f"+{dd('unsafe_shutdowns')}", "FAIL"))
-        spare, thr_s = s.get("avail_spare"), s.get("spare_thresh")
-        if spare is not None and thr_s is not None and spare <= thr_s:
-            bad.append(("available spare at/below threshold", f"{spare}% <= {thr_s}%", "FAIL"))
-        if (s.get("percent_used") or 0) >= TH["percent_used_warn"]:
-            bad.append(("endurance used", f"{s['percent_used']}%", "WARN"))
-        if (s.get("media_errors") or 0) > 0 and not dd("media_errors"):
-            bad.append(("media errors since manufacture", s["media_errors"], "WARN"))
-        temp = s.get("temperature")
-        if temp:
-            tc = temp - 273 if temp > 200 else temp
-            if tc >= TH["nvme_temp_warn_c"]:
-                bad.append(("composite temperature at end", f"{tc:.0f} C", "WARN"))
-        for what, val, v in bad:
-            add(sec, f"NVMe {c} {what}", val, "0", v)
-        if not bad:
-            add(sec, f"NVMe {c} SMART + error log", f"clean (used {s.get('percent_used', '?')}%, spare {s.get('avail_spare', '?')}%, "
-                f"written this run {((s.get('data_units_written') or 0) - (p.get('data_units_written') or 0)) * 512e3 / 1e9:.0f} GB)", "0 new", "PASS")
+    # NVMe SMART: exactly the policy used by visible drive-health rows.
+    for controller, current in a.get("nvme", {}).items():
+        health = smart_health(b.get("nvme", {}).get(controller, {}), current, a.get("nvme_selftest", {}).get(controller))
+        for issue in health["issues"]:
+            add(sec, f"NVMe {controller} {issue['check']}", issue["measured"], "0 new / captured baseline", issue["verdict"], issue["detail"])
+        if not health["issues"]:
+            add(sec, f"NVMe {controller} SMART + error log", health["health_label"], "0 new", "PASS", "read-only SMART snapshot; not readiness to ship")
     # RDMA port + hw counters
     for k, rec in a.get("rdma", {}).items():
         pb = b.get("rdma", {}).get(k, {})
@@ -2140,9 +2234,14 @@ def hardware_rows(inventory, server_dir):
         inventory = {"server": inventory}
     fio = {tag: load(Path(server_dir) / "nvme" / f"raw-{tag}.json", {}) for tag in ("seqread", "objread")}
     measured = {tag: {j.get("jobname"): j for j in data.get("jobs", [])} for tag, data in fio.items()}
+    snapshots = {}
+    for host in inventory:
+        directory = Path(server_dir) if host == "server" else Path(server_dir).parent / host
+        snapshots[host] = [load(directory / name, {}) for name in ("before.json", "after.json")]
     for host, inv in inventory.items():
         for name, drive in (inv or {}).get("nvme", {}).items():
-            record = {"host": host, "device": name, "model": drive.get("model"), "firmware": drive.get("fw"),
+            controller = drive.get("ctrl") or re.sub(r"n\d+$", "", name)
+            record = {"host": host, "device": name, "controller": controller, "serial": drive.get("serial"), "model": drive.get("model"), "firmware": drive.get("fw"),
                       "capacity_gib": drive["bytes"] / 2**30 if drive.get("bytes") is not None else None, "numa": drive.get("pcie", {}).get("numa"),
                       "pcie": drive.get("pcie", {}).get("cur"), "adapter_pcie": drive.get("pcie", {}).get("max")}
             for tag in ("seqread", "objread"):
@@ -2154,6 +2253,8 @@ def hardware_rows(inventory, server_dir):
                 if record[tag + "_p99_ms"] is not None:
                     record[tag + "_p99_ms"] /= 1e6
                 record[tag + "_errors"] = job.get("error")
+            before, after = snapshots[host]
+            record.update(smart_health(before.get("nvme", {}).get(controller, {}), after.get("nvme", {}).get(controller, {}), after.get("nvme_selftest", {}).get(controller)))
             drives.append(record)
         for name, nic in (inv or {}).get("nics", {}).items():
             for port, details in (nic.get("ports") or {"?": {}}).items():
@@ -2213,7 +2314,7 @@ def report_html(document):
             for key, label in columns:
                 value = record.get(key)
                 shown = badge(record.get('status', 'INFO'), value) if key == 'status' else text(value)
-                if key == 'verdict':
+                if key in ('verdict', 'health_status', 'self_test_status'):
                     shown = badge(value)
                 cells.append(f'<td data-sort="{text(value)}">{shown}</td>')
             lines.append('<tr>' + ''.join(cells) + '</tr>')
@@ -2257,7 +2358,7 @@ def report_html(document):
         ('refusals', 'Refusal attempts')], latency) + '</section>')
     hardware = document.get('hardware', {})
     sections.append('<section><h2>Drives</h2><p>Click a column header to sort. Raw drive tests do not prove these drives back the selected L3 filesystem. — means not measured.</p>' +
-        table([('host', 'Host'), ('device', 'Drive'), ('model', 'Model'), ('capacity_gib', 'GiB'), ('firmware', 'Firmware'), ('numa', 'NUMA'),
+        table([('host', 'Host'), ('device', 'Drive'), ('health_status', 'Health'), ('health_label', 'Health assessment'), ('serial', 'Serial'), ('model', 'Model'), ('capacity_gib', 'GiB'), ('firmware', 'Firmware'), ('numa', 'NUMA'),
                ('pcie', 'Negotiated PCIe'), ('adapter_pcie', 'Adapter capability'), ('seqread_gbps', 'Sequential GB/s'), ('seqread_p99_ms', 'Sequential p99 ms'),
                ('objread_gbps', 'Object GB/s'), ('objread_p99_ms', 'Object p99 ms'), ('seqread_errors', 'Sequential error'), ('objread_errors', 'Object error')], hardware.get('drives', [])) + '</section>')
     def optics_summary(modules):
@@ -2289,7 +2390,15 @@ def report_html(document):
         sections.append('<details open><summary>' + text(finding.get('phase')) + '</summary><p>' + text(finding.get('verdict')) + '</p>' +
             table([('resource', 'Resource'), ('score', 'Utilization ratio'), ('evidence', 'Evidence')], finding.get('top', [])) +
             '<ul>' + ''.join('<li>' + text(f) + '</li>' for f in finding.get('facts', [])) + '</ul></details>')
-    sections.append('<ul>' + ''.join('<li>' + text(note) + '</li>' for note in document.get('notes', [])) + '</ul></section></main>')
+    sections.append('<ul>' + ''.join('<li>' + text(note) + '</li>' for note in document.get('notes', [])) + '</ul></section>')
+    health_columns = [('host', 'Host'), ('device', 'Drive'), ('health_status', 'Health'), ('health_label', 'Assessment'), ('serial', 'Serial'), ('self_test_status', 'Recorded self-test'), ('self_test_label', 'Last self-test assessment'), ('self_test_result', 'Result code'),
+        ('critical_warning_hex', 'Critical warning'), ('critical_warning_decoded', 'Decoded warning'), ('media_errors', 'Media errors lifetime'), ('media_errors_delta', 'Media Δ'),
+        ('error_log_entries', 'Error entries lifetime'), ('error_log_delta', 'Error entries Δ'), ('wear_percent', 'Used %'), ('spare_percent', 'Spare %'),
+        ('spare_threshold', 'Spare threshold %'), ('temperature_c', 'Temp °C'), ('power_on_hours', 'Power-on hours'), ('unsafe_shutdowns', 'Unsafe shutdowns lifetime'),
+        ('unsafe_shutdowns_delta', 'Unsafe shutdowns Δ'), ('warning_temp_time_delta', 'Warning temp minutes Δ'), ('critical_comp_time_delta', 'Critical temp minutes Δ'),
+        ('thermal_seconds_delta', 'Throttle seconds Δ'), ('thermal_transitions_delta', 'Throttle transitions Δ'), ('health_evidence', 'Evidence')]
+    sections.append('<section><h2>Drive health</h2><p>Most important: read-only SMART measurements with lifetime counters and before/after deltas. No SMART fault detected does not mean ready to ship. Historical error entries may be administrative; inspect status codes. Missing data is UNKNOWN.</p>' +
+                    table(health_columns, hardware.get('drives', [])) + '</section></main>')
     css = '''
 :root{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;color:#142238;background:#edf2f7;font-variant-numeric:tabular-nums;line-height:1.5}*{box-sizing:border-box}body{margin:0}header{background:#10243b;color:white;padding:34px max(24px,calc((100vw - 1500px)/2));border-bottom:5px solid #32b8c5}h1{font-size:34px;margin:6px 0}header p{margin:4px 0;color:#c7d5e5}.eyebrow{font-size:12px;letter-spacing:.15em;font-weight:700}main{min-width:0;max-width:1550px;margin:auto;padding:24px}.banner{background:#fff5d6;border-left:5px solid #bd8315;border-radius:8px;padding:18px 22px}.banner p{margin:6px 0;font-size:14px}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin:22px 0}.metric{min-width:0;background:white;border:1px solid #d9e2ed;border-radius:12px;padding:20px;box-shadow:0 3px 9px #172b4d08}.metric .badge{white-space:normal;overflow-wrap:anywhere}.metric>div{color:#53677e;font-size:13px;font-weight:700}.metric strong{font-size:34px;display:block}.metric small{font-size:15px;font-weight:500}.metric p{font-size:12px;color:#53677e}.badge{display:inline-block;font-size:11px;font-weight:750;border-radius:5px;padding:3px 7px;white-space:nowrap}.PASS{background:#def5e8;color:#086839}.WARN{background:#fff0c2;color:#805600}.FAIL{background:#ffe0df;color:#a32020}.INFO{background:#deedff;color:#155a9d}.SKIP{background:#e8edf2;color:#617084}.counts{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.counts>span{font-size:12px;color:#617084}section{min-width:0;background:white;border:1px solid #d9e2ed;border-radius:12px;margin:20px 0;padding:22px}h2{font-size:21px;margin:0 0 8px}h3{font-size:16px;margin:24px 0 10px}section>p{font-size:13px;color:#52647b}.scroll{overflow:auto;max-width:100%;border:1px solid #d9e2ed;border-radius:7px}table{border-collapse:collapse;width:100%;font-size:12px}thead{background:#edf3fa}th,td{padding:10px 12px;border-bottom:1px solid #e5eaf0;text-align:left;vertical-align:top}th{white-space:normal;min-width:90px;font-size:11px;color:#40536b}td{white-space:nowrap}td:last-child{white-space:normal;min-width:160px}tbody tr:nth-child(even){background:#f8fafc}tbody tr:hover{background:#ecf5ff}th button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer;text-align:left}th button:after{content:' ↕';color:#8a9bb0}details{margin:12px 0;border:1px solid #d9e2ed;border-radius:8px;padding:12px}summary{cursor:pointer;font-weight:650;font-size:13px}summary span{font-weight:400;font-size:12px;color:#617084;margin-left:12px}details .scroll{margin-top:12px}li{font-size:13px;overflow-wrap:anywhere}@media(max-width:900px){.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}main{padding:12px}section{padding:14px}header{padding:24px}.metric strong{font-size:28px}}@media(max-width:500px){.metrics{grid-template-columns:1fr}h1{font-size:27px}}@media print{@page{size:landscape;margin:10mm}body{background:white;color:black}header{background:white;color:black;padding:0 0 12px;border-bottom:2px solid #333}header p{color:#333}main{max-width:none;padding:0}.metrics{gap:8px}.metric,section{box-shadow:none;break-inside:avoid;padding:10px;margin:10px 0}.scroll{overflow:visible}table{font-size:8px;width:100%;table-layout:fixed}th,td{min-width:0!important;white-space:normal!important;word-break:break-word;padding:4px}details{break-inside:auto}.badge{font-size:8px;padding:2px}th button:after{content:''}.banner{padding:10px}.metric strong{font-size:23px}}
 '''

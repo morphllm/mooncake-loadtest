@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +40,15 @@ def benchmark():
             'get_nvme': {'0': sample(misses=3)},
             'mixed': {'0': {'put': sample(gbps=1.25), 'get': sample(gbps=2.0)}},
         },
+    }
+
+
+def smart_snapshot(**changes):
+    return {
+        'critical_warning': 0, 'media_errors': 0, 'num_err_log_entries': 7,
+        'percent_used': 0, 'avail_spare': 100, 'spare_thresh': 10,
+        'temperature': 310, 'power_on_hours': 24, 'unsafe_shutdowns': 0,
+        'warning_temp_time': 0, 'critical_comp_time': 0, **changes,
     }
 
 
@@ -169,6 +179,131 @@ class ReportTests(unittest.TestCase):
                 self.assertIsNone(nic['rate'])
                 self.assertIsNone(nic['rate_gbit'])
                 self.assertEqual(nic['raw_port_rate'], '400 Gb/sec')
+
+    def test_healthy_smart_is_scoped_to_reported_faults(self):
+        health = self.report.smart_health(smart_snapshot(), smart_snapshot())
+        self.assertEqual(health['health_status'], 'PASS')
+        self.assertIn('no smart fault', health['health_label'].lower())
+        self.assertNotIn('qualified', health['health_label'].lower())
+        self.assertEqual(health['critical_warning'], 0)
+        self.assertEqual(health['media_errors_delta'], 0)
+        self.assertEqual(health['wear_percent'], 0)
+        self.assertEqual(health['spare_percent'], 100)
+        self.assertAlmostEqual(health['temperature_c'], 36.85, delta=.2)
+
+    def test_smart_critical_warning_or_new_media_error_is_failed(self):
+        for changes in ({'critical_warning': 1}, {'media_errors': 1}):
+            with self.subTest(changes=changes):
+                health = self.report.smart_health(smart_snapshot(), smart_snapshot(**changes))
+                self.assertEqual(health['health_status'], 'FAIL')
+        health = self.report.smart_health(smart_snapshot(), smart_snapshot(critical_warning=1))
+        self.assertTrue(health['critical_warning_decoded'])
+        self.assertEqual(int(health['critical_warning_hex'], 16), 1)
+        incomplete = self.report.smart_health({}, smart_snapshot(critical_warning=1))
+        self.assertEqual(incomplete['health_status'], 'FAIL')
+
+    def test_missing_smart_remains_unknown(self):
+        health = self.report.smart_health({}, {})
+        self.assertEqual(health['health_status'], 'SKIP')
+        self.assertIsNone(health['critical_warning'])
+        self.assertIsNone(health['temperature_c'])
+        self.assertIsNone(health['wear_percent'])
+
+    def test_error_log_history_is_not_a_new_failure(self):
+        health = self.report.smart_health(smart_snapshot(), smart_snapshot())
+        self.assertNotEqual(health['health_status'], 'FAIL')
+        self.assertEqual(health['error_log_entries'], 7)
+        self.assertEqual(health['error_log_delta'], 0)
+
+    def test_new_error_log_obeys_explicit_strict_and_lenient_modes(self):
+        for strict, expected in ((True, 'FAIL'), (False, 'WARN')):
+            with self.subTest(strict=strict), patch.object(self.report, 'STRICT', strict):
+                health = self.report.smart_health(smart_snapshot(), smart_snapshot(num_err_log_entries=8))
+                self.assertEqual(health['health_status'], expected)
+                self.assertEqual(health['error_log_delta'], 1)
+
+    def test_wear_and_reset_counters_are_warnings(self):
+        for changes in ({'percent_used': 80}, {'num_err_log_entries': 6}):
+            with self.subTest(changes=changes):
+                health = self.report.smart_health(smart_snapshot(), smart_snapshot(**changes))
+                self.assertEqual(health['health_status'], 'WARN')
+
+    def test_namespace_health_joins_its_controller_not_a_prefix_neighbor(self):
+        inventory = {'nvme': {
+            'nvme12n1': {'model': 'Synthetic', 'serial': 'TEST-ONLY'},
+            'nvme1n1': {'model': 'Synthetic', 'ctrl': 'nvme1'},
+        }}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'before.json').write_text(json.dumps({'nvme': {
+                'nvme12': smart_snapshot(), 'nvme1': smart_snapshot(),
+            }}))
+            (root / 'after.json').write_text(json.dumps({'nvme': {
+                'nvme12': smart_snapshot(temperature=313),
+                'nvme1': smart_snapshot(critical_warning=2),
+            }}))
+            hardware = self.report.hardware_rows(inventory, root)
+        drives = {drive['device']: drive for drive in hardware['drives']}
+        self.assertEqual(drives['nvme12n1']['controller'], 'nvme12')
+        self.assertEqual(drives['nvme12n1']['health_status'], 'PASS')
+        self.assertAlmostEqual(drives['nvme12n1']['temperature_c'], 39.85, delta=.2)
+        self.assertEqual(drives['nvme12n1']['serial'], 'TEST-ONLY')
+        self.assertEqual(drives['nvme1n1']['health_status'], 'FAIL')
+        page = self.report.report_html({'hardware': hardware, 'traffic': []})
+        self.assertIn('TEST-ONLY', page)
+        self.assertIn(drives['nvme12n1']['health_label'], page)
+        self.assertIn(drives['nvme1n1']['health_label'], page)
+
+    def test_last_self_test_pass_supports_both_snapshot_schemas(self):
+        logs = (
+            {'Current Device Self-Test Operation': 0,
+             'List of Valid Reports': [{'Self test result': 0}]},
+            {'current_operation': 0, 'valid_reports': [{'result': 0}]},
+        )
+        for log in logs:
+            with self.subTest(log=log):
+                test = self.report.self_test_health(log)
+                self.assertEqual(test['self_test_status'], 'PASS')
+                self.assertEqual(test['self_test_result'], 0)
+                self.assertEqual(test['self_test_current_operation'], 0)
+                self.assertIn('last recorded', test['self_test_label'])
+                self.assertNotIn('qualified', test['self_test_label'])
+
+    def test_self_test_unknown_running_failure_and_abort_classifications(self):
+        cases = [({}, 'SKIP'),
+                 ({'current_operation': 0, 'valid_reports': [{'result': 15}]}, 'SKIP'),
+                 ({'valid_reports': [{'result': 0}]}, 'WARN'),
+                 ({'current_operation': 1, 'valid_reports': [{'result': 0}]}, 'WARN')]
+        cases += [({'current_operation': 0, 'valid_reports': [{'result': code}]}, 'FAIL')
+                  for code in (5, 6, 7)]
+        cases += [({'current_operation': 0, 'valid_reports': [{'result': code}]}, 'WARN')
+                  for code in (1, 2, 3, 4, 8, 9)]
+        for log, expected in cases:
+            with self.subTest(log=log):
+                test = self.report.self_test_health(log)
+                self.assertEqual(test['self_test_status'], expected)
+
+    def test_failed_self_test_propagates_through_controller_health_join(self):
+        inventory = {'nvme': {'nvme12n1': {}, 'nvme1n1': {}}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshots = {'nvme12': smart_snapshot(), 'nvme1': smart_snapshot()}
+            (root / 'before.json').write_text(json.dumps({'nvme': snapshots}))
+            (root / 'after.json').write_text(json.dumps({
+                'nvme': snapshots,
+                'nvme_selftest': {
+                    'nvme12': {'Current Device Self-Test Operation': 0,
+                               'List of Valid Reports': [{'Self test result': 0}]},
+                    'nvme1': {'current_operation': 0, 'valid_reports': [{'result': 7}]},
+                },
+            }))
+            hardware = self.report.hardware_rows(inventory, root)
+        drives = {drive['device']: drive for drive in hardware['drives']}
+        self.assertEqual(drives['nvme12n1']['self_test_status'], 'PASS')
+        self.assertEqual(drives['nvme12n1']['health_status'], 'PASS')
+        self.assertEqual(drives['nvme1n1']['self_test_status'], 'FAIL')
+        self.assertEqual(drives['nvme1n1']['self_test_result'], 7)
+        self.assertEqual(drives['nvme1n1']['health_status'], 'FAIL')
 
     def test_html_escapes_untrusted_host_checks_and_notes(self):
         attack = '<img src=x onerror="alert(1)">'
