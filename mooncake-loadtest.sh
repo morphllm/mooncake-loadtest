@@ -1406,7 +1406,7 @@ def main(run):
                 add(sec, f"{h} {dev} NUMA node", "unknown (-1)", "known", "WARN", "cannot pin the leg next to the NIC")
             for ndv, mod in v.get("module", {}).items():
                 if mod.get("alarms_on"):
-                    add(sec, f"{h} {dev} optics alarms", "; ".join(mod["alarms_on"][:4]), "none", "WARN", "transceiver reports flags; an uncabled port may report alarms, so compare with intended cabling")
+                    add(sec, f"{h} {dev} optics alarms", "; ".join(mod["alarms_on"][:4]), "none", "FAIL", "transceiver reports flags; an uncabled port may report alarms, so compare with intended cabling")
         for hca, fw in fws.items():
             if len(fw) > 1:
                 add(sec, f"{h} NIC firmware consistent ({hca})", ",".join(sorted(fw)), "one approved baseline", "WARN", "confirm approved baseline; performance impact unproven")
