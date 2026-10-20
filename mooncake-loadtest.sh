@@ -29,10 +29,16 @@
 #   --wheel non-cuda|cuda12|cuda13  Mooncake wheel flavour (default non-cuda: a store box needs no GPU stack)
 #   --mooncake-version X.Y.Z        pin the wheel (default: latest on PyPI)
 #   --lenient                       correctable PCIe/memory/NVMe-log errors are WARN instead of FAIL
+#   --wheel-url HTTPS_URL          fetch a reviewed wheel (requires --wheel-sha256)
+#   --wheel-file PATH              install a local wheel artifact (requires --wheel-sha256)
+#   --expected-tag TAG              require this physical server DMI service tag
+#   --expected-drives N             require N inventoried NVMe namespaces
+#   --l3-drives N                   require N distinct NVMe namespaces backing L3
 #   --no-install                    skip apt/dnf/pip (reuse /opt/mooncake-loadtest)
 # Other modes:
 #   report <run-dir>                re-render the report of a finished run
-#   clean                           kill leftover masters/legs/benches from an interrupted run
+#   drives inventory|plan|run|os-read|scratch  guarded full-capacity acceptance (drives --help)
+#   clean                           explain scoped process cleanup
 #
 # Output: /opt/mooncake-loadtest/runs/<timestamp>-<host>/ (report.txt, report.json, raw data, logs) and a .tar.gz of it.
 # Exit code: 0 = no FAIL, 1 = at least one FAIL, 2 = the test itself could not run.
@@ -43,7 +49,7 @@
 # evicted ones with O_DIRECT io_uring reads into a registered staging arena. Every phase below measures one hop of that.
 set -euo pipefail
 
-MCL_VERSION=2026.10.13
+MCL_VERSION=2026.10.20
 MCL_URL=https://raw.githubusercontent.com/morphllm/mooncake-loadtest/main/mooncake-loadtest.sh
 WORK=${MCL_WORK:-/opt/mooncake-loadtest}
 LIB=$WORK/lib
@@ -61,7 +67,7 @@ mark() { printf '{"phase":"%s","t0":%s,"t1":%s}\n' "$1" "$2" "$3" >>"$4"; }
 port() { echo $((PORT_BASE + $1 * 20 + $2)); }
 
 usage() { sed -n '2,46p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null | sed 's/^# \{0,1\}//' || true
-  echo "usage: mooncake-loadtest.sh [single|server|client|report <dir>|clean] [flags]  (see header of the script)"; exit 2; }
+  echo "usage: mooncake-loadtest.sh [single|server|client|report <dir>|drives|clean] [flags]  (see header of the script)"; exit 2; }
 
 # ════════════════════════════════════════════════════════════════════════════════════════════
 # Install: system tools + an isolated venv with the Mooncake wheel. Idempotent.
@@ -117,6 +123,29 @@ managed_python() {
   UV_PYTHON_INSTALL_DIR="$WORK/python" "$WORK/bin/uv" python find --managed-python 3.13
 }
 
+prepare_wheel() {
+  local py=$1
+  if [ -n "$WHEEL_URL" ]; then
+    [ -z "$WHEEL_FILE" ] && [[ "$WHEEL_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || die "--wheel-url requires SHA256 and cannot combine with --wheel-file"
+    local artifact
+    artifact=$("$py" - "$WHEEL_URL" <<'PYURL'
+import posixpath, sys, urllib.parse
+url = urllib.parse.urlsplit(sys.argv[1])
+name = posixpath.basename(url.path)
+if url.scheme != "https" or not url.netloc or not name.endswith(".whl"):
+    raise SystemExit("wheel URL must be HTTPS and end in a wheel filename")
+print(name)
+PYURL
+) || die "invalid wheel URL"
+    mkdir -p "$WORK/wheels/$WHEEL_SHA256"
+    WHEEL_FILE="$WORK/wheels/$WHEEL_SHA256/$artifact"
+    if [ ! -f "$WHEEL_FILE" ]; then
+      curl --fail --location --proto '=https' --proto-redir '=https' "$WHEEL_URL" -o "$WHEEL_FILE.download" || die "wheel download failed"
+      mv "$WHEEL_FILE.download" "$WHEEL_FILE"
+    fi
+  fi
+}
+
 install_python() {
   local py wheel
   py=$(pick_python) || die "need Python 3.10-3.13 for the Mooncake wheel"
@@ -132,7 +161,15 @@ install_python() {
   for w in mooncake-transfer-engine-non-cuda mooncake-transfer-engine mooncake-transfer-engine-cuda13; do
     [ "$w" = "$wheel" ] || "$PY" -m pip uninstall -q -y "$w" >/dev/null 2>&1 || true   # flavours share the package dir
   done
-  "$PY" -m pip install "$wheel${MC_VERSION:+==$MC_VERSION}" numpy || die "pip install $wheel failed"
+  prepare_wheel "$py"
+  if [ -n "$WHEEL_FILE" ]; then
+    [ -f "$WHEEL_FILE" ] && [ -n "$WHEEL_SHA256" ] || die "--wheel-file requires an existing local file and --wheel-sha256"
+    printf '%s  %s\n' "$WHEEL_SHA256" "$WHEEL_FILE" | sha256sum --check --status || die "wheel SHA256 mismatch"
+    "$PY" -m pip install "$WHEEL_FILE" numpy || die "pip install wheel artifact failed"
+  else
+    [ -z "$WHEEL_SHA256" ] || die "--wheel-sha256 requires --wheel-file"
+    "$PY" -m pip install "$wheel${MC_VERSION:+==$MC_VERSION}" numpy || die "pip install $wheel failed"
+  fi
   if [ "$WHEEL" != non-cuda ] && ! ldconfig -p | grep -q 'libcuda.so.1'; then
     # A CUDA wheel links libcuda/libcudart even when no GPU is used: the driver userspace + pip runtime satisfy it.
     "$PY" -m pip install -q nvidia-cuda-runtime-cu12 >/dev/null 2>&1 || true
@@ -145,6 +182,7 @@ install_python() {
   "$PY" -c 'from mooncake.store import MooncakeDistributedStore' || die "mooncake.store does not import (see error above)"
   MC_DIR=$("$PY" -c 'import mooncake, os; print(os.path.dirname(mooncake.__file__))')
   [ -x "$MC_DIR/mooncake_master" ] || die "$MC_DIR/mooncake_master missing from the wheel"
+  validate_runtime
   log "installed $(wheel_version) at $MC_DIR"
 }
 wheel_version() { "$PY" - <<'PY' 2>/dev/null || true
@@ -155,11 +193,33 @@ for p in ("mooncake-transfer-engine-non-cuda", "mooncake-transfer-engine", "moon
 PY
 }
 
+validate_runtime() {
+  "$PY" - "$WHEEL" "$MC_VERSION" <<'PYRUNTIME' || die "installed wheel does not match requested flavor/version"
+import importlib.metadata as metadata
+import sys
+from mooncake.store import MooncakeDistributedStore
+packages = {"non-cuda": "mooncake-transfer-engine-non-cuda", "cuda12": "mooncake-transfer-engine", "cuda13": "mooncake-transfer-engine-cuda13"}
+installed = metadata.version(packages[sys.argv[1]])
+if sys.argv[2] and installed != sys.argv[2]:
+    raise SystemExit(f"requested {sys.argv[2]}, installed {installed}")
+PYRUNTIME
+  [ -x "$MC_DIR/mooncake_master" ] || die "wheel lacks executable mooncake_master"
+  "$PY" - "$MC_DIR/mooncake_master" <<'PYMASTER' || die "mooncake_master cannot execute on this host"
+import subprocess, sys
+p = subprocess.run([sys.argv[1], "--help"], capture_output=True, text=True, timeout=15)
+help_text = (p.stdout + p.stderr).lower()
+# gflags exits 1 after successfully printing help.
+if p.returncode not in (0, 1) or not any(marker in help_text for marker in ("flags from", "usage:")):
+    raise SystemExit(help_text or f"master exited {p.returncode}")
+PYMASTER
+}
+
 install_all() {
   mkdir -p "$WORK" "$LIB"
   if [ -z "$NO_INSTALL" ]; then install_system; install_python; else
     [ -x "$PY" ] || die "--no-install but $PY missing"
     MC_DIR=$("$PY" -c 'import mooncake, os; print(os.path.dirname(mooncake.__file__))')
+    validate_runtime
   fi
   write_payload
 }
@@ -168,6 +228,442 @@ install_all() {
 # Payload: the Python/C pieces, written next to the venv. Each is a self-contained file.
 # ════════════════════════════════════════════════════════════════════════════════════════════
 write_payload() {
+
+cat >"$LIB/drive_acceptance.py" <<'PYDRIVE'
+#!/usr/bin/env python3
+"""Full-capacity NVMe acceptance with explicit host and serial authorization.
+
+Evidence stays; this program never creates filesystems, changes firmware, or sanitizes.
+"""
+import argparse
+import concurrent.futures
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import threading
+import time
+
+INVENTORY_LOCK = threading.Lock()
+
+
+def command(argv, timeout=30):
+    p = subprocess.run(argv, text=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, timeout=timeout)
+    return {"argv": argv, "returncode": p.returncode, "stdout": p.stdout, "stderr": p.stderr}
+
+
+def checked(argv):
+    result = command(argv)
+    if result["returncode"]:
+        raise RuntimeError(result)
+    return result["stdout"]
+
+
+def save(path, value):
+    Path(path).write_text(json.dumps(value, indent=2) + "\n")
+
+
+def flatten(tree):
+    nodes, edges = {}, {}
+    def visit(node, parent=None):
+        name = node["kname"]
+        nodes[name] = {k: v for k, v in node.items() if k != "children"}
+        edges.setdefault(name, set())
+        if parent:
+            edges.setdefault(parent, set()).add(name)
+        for child in node.get("children", []):
+            visit(child, name)
+    for node in tree["blockdevices"]:
+        visit(node)
+    return nodes, edges
+
+
+def descendants(name, edges):
+    found, pending = set(), [name]
+    while pending:
+        item = pending.pop()
+        if item not in found:
+            found.add(item)
+            pending.extend(edges.get(item, ()))
+    return found
+
+
+def protection(nodes, edges, swaps, holders, opened):
+    """Pure guard logic, fixture-tested independently of the host."""
+    result = {}
+    for name, node in nodes.items():
+        if node["type"] != "disk":
+            continue
+        reasons = []
+        for child in sorted(descendants(name, edges)):
+            n = nodes[child]
+            mounts = [x for x in (n.get("mountpoints") or []) if x]
+            if mounts:
+                reasons.append(f"{child} mounted: {mounts}")
+            if n["path"] in swaps or "[SWAP]" in mounts:
+                reasons.append(f"{child} is swap")
+            if holders.get(child):
+                reasons.append(f"{child} has holders: {holders[child]}")
+            if child in opened:
+                reasons.append(f"{child} open by processes: {opened[child]}")
+            if n.get("ro"):
+                reasons.append(f"{child} read-only")
+        result[name] = reasons
+    return result
+
+
+def open_blocks(nodes):
+    devices = {}
+    for name, node in nodes.items():
+        s = os.stat(node["path"])
+        if not stat.S_ISBLK(s.st_mode):
+            raise RuntimeError(f"not a block device: {node['path']}")
+        devices[s.st_rdev] = name
+    opened = {}
+    for proc in Path('/proc').glob('[0-9]*'):
+        try:
+            fds = list((proc / 'fd').iterdir())
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError as exc:
+            raise RuntimeError(f"cannot inspect {proc}/fd") from exc
+        for fd in fds:
+            try:
+                s = fd.stat()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if stat.S_ISBLK(s.st_mode) and s.st_rdev in devices:
+                opened.setdefault(devices[s.st_rdev], []).append(proc.name)
+    return opened
+
+
+def swap_paths(text):
+    # /proc is available across util-linux versions; swapon has no portable JSON mode.
+    paths = set()
+    for line in text.splitlines()[1:]:
+        if line.strip():
+            path = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), line.split()[0])
+            paths.add(os.path.realpath(path))
+    return paths
+
+
+def inventory():
+    if os.geteuid() != 0:
+        raise RuntimeError('root required for complete safety inventory')
+    tree = json.loads(checked(['lsblk', '--json', '--bytes', '--output',
+                             'NAME,KNAME,PATH,TYPE,SIZE,SERIAL,WWN,MOUNTPOINTS,PKNAME,FSTYPE,RO']))
+    nodes, edges = flatten(tree)
+    if not any('/' in (n.get('mountpoints') or []) for n in nodes.values()):
+        raise RuntimeError('cannot identify the physical backing topology of root; refusing')
+    swaps = swap_paths(Path('/proc/swaps').read_text())
+    holders = {name: sorted(p.name for p in (Path('/sys/class/block') / name / 'holders').iterdir())
+               for name in nodes}
+    opened = open_blocks(nodes)
+    return {'time': dt.datetime.now(dt.timezone.utc).isoformat(),
+            'service_tag': checked(['dmidecode', '-s', 'system-serial-number']).strip(),
+            'model': checked(['dmidecode', '-s', 'system-product-name']).strip(),
+            'ssh_connection': os.getenv('SSH_CONNECTION'),
+            'addresses': json.loads(checked(['ip', '-json', 'address'])),
+            'lsblk': tree, 'nodes': nodes,
+            'protected': protection(nodes, edges, swaps, holders, opened),
+            'mounts': json.loads(checked(['findmnt', '--json'])),
+            'nvme_list': command(['nvme', 'list', '--output-format=json']),
+            'fio_version': checked(['fio', '--version']).strip(),
+            'swap': sorted(swaps), 'holders': holders, 'open_block_devices': opened}
+
+
+def targets(inv, expected_tag, allowlist):
+    if not expected_tag or inv['service_tag'] != expected_tag:
+        raise RuntimeError(f"service tag mismatch: {inv['service_tag']!r}")
+    if not isinstance(allowlist, list) or not allowlist:
+        raise RuntimeError('allowlist must be a nonempty JSON list of {device, serial, bytes}')
+    result, seen = [], set()
+    for entry in allowlist:
+        path, serial, size = entry['device'], entry['serial'], entry['bytes']
+        if (not re.fullmatch(r'/dev/nvme\d+n\d+', path)
+                or not re.fullmatch(r'[A-Za-z0-9_.-]+', serial) or not isinstance(size, int)):
+            raise RuntimeError(f'invalid allowlist entry: {entry}')
+        node = inv['nodes'].get(Path(path).name)
+        if not node or node['type'] != 'disk' or node['path'] != path:
+            raise RuntimeError(f'not an inventoried raw NVMe disk: {path}')
+        if (node.get('serial') or '').strip() != serial.strip() or node['size'] != size:
+            raise RuntimeError(f'serial/capacity mismatch: {path}')
+        if serial in seen or sum((n.get('serial') or '').strip() == serial.strip()
+                                 for n in inv['nodes'].values() if n['type'] == 'disk') != 1:
+            raise RuntimeError(f'duplicate/ambiguous serial: {serial}')
+        if inv['protected'][node['kname']]:
+            raise RuntimeError(f"protected {path}: {inv['protected'][node['kname']]}")
+        if size < 1048576 or size % 4096:
+            raise RuntimeError(f'capacity must be a positive multiple of 4096: {path}')
+        seen.add(serial)
+        result.append(node)
+    return result
+
+
+def health(device, directory, label):
+    result = {}
+    for kind, args in [('smart', ['smart-log']), ('errors', ['error-log', '--log-entries=64']),
+                       ('identify', ['id-ctrl'])]:
+        result[kind] = command(['nvme', *args, device, '--output-format=json'])
+    save(directory / f'{label}.json', result)
+    return result
+
+
+def smart_delta(before, after):
+    try:
+        for snapshot in [before, after]:
+            if any(value['returncode'] for value in snapshot.values()):
+                return {'status': 'UNKNOWN', 'reason': 'a health command failed'}
+        a, b = [json.loads(x['smart']['stdout']) for x in [before, after]]
+        keys = ['media_errors', 'num_err_log_entries', 'critical_warning']
+        numbers = {key: [int(a[key]), int(b[key])] for key in keys}
+        failed = (any(y > x for x, y in numbers.values())
+                  or numbers['critical_warning'][1] != 0 or numbers['media_errors'][1] != 0)
+        return {'status': 'CHANGED_OR_WARNING' if failed else 'NO_NEW_RECORDED_FAULT',
+                'before_after': numbers}
+    except (ValueError, KeyError, TypeError) as exc:
+        return {'status': 'UNKNOWN', 'reason': str(exc)}
+
+
+def fio_job(device, size, writable, regular=False):
+    header = ['[global]', f'filename={device}', 'ioengine=io_uring', 'direct=1',
+              'iodepth=32', 'numjobs=1', 'thread=1', 'rw=write' if writable else 'rw=read',
+              f'allow_file_create={int(regular)}', 'allow_mounted_write=0']
+    if writable:
+        header += ['verify=crc32c', 'do_verify=1', 'verify_fatal=1', 'verify_dump=0',
+                   'verify_state_save=0', 'end_fsync=1']
+    bulk = size // 1048576 * 1048576
+    header += ['[bulk]', 'bs=1M', f'size={bulk}']
+    if size != bulk:
+        header += ['[tail]', 'stonewall', 'bs=4k', f'offset={bulk}', f'size={size - bulk}']
+    return '\n'.join(header) + '\n'
+
+
+def fio_pass(data, size, writable):
+    jobs = data.get('jobs', [])
+    if not jobs or any(j.get('error', 1) for j in jobs):
+        return False
+    reads = sum(j.get('read', {}).get('io_bytes', 0) for j in jobs)
+    writes = sum(j.get('write', {}).get('io_bytes', 0) for j in jobs)
+    return reads == size and writes == (size if writable else 0)
+
+
+def one_drive(node, args, writable=True):
+    directory = args.out / node['serial'].strip()
+    directory.mkdir()
+    result = {'device': node['path'], 'serial': node['serial'], 'bytes': node['size'],
+              'status': 'FAILED', 'test': 'FULL_WRITE_CRC32C_READBACK' if writable else 'FULL_RAW_READ_ONLY'}
+    stop = threading.Event()
+    sampler_failed = threading.Event()
+    def sample():
+        with (directory / 'smart-samples.jsonl').open('a') as f:
+            while not stop.is_set():
+                try:
+                    record = {'time': time.time(), **command(
+                        ['nvme', 'smart-log', node['path'], '--output-format=json'])}
+                except Exception as exc:
+                    sampler_failed.set()
+                    record = {'time': time.time(), 'returncode': -1, 'stdout': '', 'stderr': str(exc)}
+                f.write(json.dumps(record) + '\n')
+                f.flush()
+                stop.wait(30)
+    sampler = threading.Thread(target=sample, daemon=True)
+    try:
+        job = directory / 'full.fio'
+        job.write_text(fio_job(node['path'], node['size'], writable))
+        result['fio_parse'] = command(['fio', '--parse-only', str(job)])
+        if result['fio_parse']['returncode']:
+            raise RuntimeError(result['fio_parse'])
+        before = health(node['path'], directory, 'before')
+        # Re-inspect identity and occupancy immediately before the first destructive operation.
+        with INVENTORY_LOCK:
+            current = inventory()
+            if writable:
+                targets(current, args.expected_tag, [{'device': node['path'],
+                        'serial': node['serial'], 'bytes': node['size']}])
+            else:
+                identity(current, args.expected_tag, node['path'], node['serial'])
+        if writable:
+            discard = int((Path('/sys/class/block') / node['kname'] / 'queue/discard_max_bytes').read_text())
+            if discard:
+                result['discard'] = command(['blkdiscard', '--verbose', node['path']], timeout=600)
+                if result['discard']['returncode']:
+                    message = result['discard']['stderr'].lower()
+                    if 'not supported' not in message:
+                        raise RuntimeError(result['discard'])
+                    result['discard']['status'] = 'UNSUPPORTED'
+            else:
+                result['discard'] = {'status': 'UNSUPPORTED', 'discard_max_bytes': 0}
+        result['fio_started'] = time.time()
+        sampler.start()
+        with (directory / 'fio.stderr').open('w') as err, (directory / 'fio.stdout').open('w') as out:
+            p = subprocess.run(['fio', *([] if writable else ['--readonly']), '--output-format=json', f'--output={directory / "fio.json"}',
+                                str(job)], stdout=out, stderr=err)
+        result['fio_finished'] = time.time()
+        result['fio_returncode'] = p.returncode
+        if p.returncode == 0 and fio_pass(json.loads((directory / 'fio.json').read_text()), node['size'], writable):
+            result['status'] = 'FULL_BYTES_VERIFIED' if writable else 'FULL_BYTES_READ'
+    except Exception as exc:
+        result['exception'] = str(exc)
+    finally:
+        stop.set()
+        if sampler.is_alive():
+            sampler.join(timeout=35)
+        samples = []
+        sample_file = directory / 'smart-samples.jsonl'
+        if sample_file.exists():
+            samples = [json.loads(line) for line in sample_file.read_text().splitlines()]
+        temperatures = []
+        for record in samples:
+            try:
+                if record['returncode']:
+                    continue
+                value = float(json.loads(record['stdout'])['temperature'])
+                temperatures.append(value - 273.15 if value > 200 else value)
+            except (ValueError, KeyError, TypeError):
+                pass
+        result['temperature_coverage'] = {
+            'samples': len(samples), 'valid_temperature_samples': len(temperatures),
+            'sample_interval_s': 30, 'max_c': max(temperatures, default=None),
+            'max_observed_gap_s': max((b['time'] - a['time'] for a, b in zip(samples, samples[1:])), default=None)}
+        coverage = result['temperature_coverage']
+        coverage['sampler_failed'] = sampler_failed.is_set()
+        coverage['first_sample'] = samples[0]['time'] if samples else None
+        coverage['last_sample'] = samples[-1]['time'] if samples else None
+        coverage['spans_fio'] = bool(samples and 'fio_started' in result and 'fio_finished' in result
+            and samples[0]['time'] <= result['fio_started'] + 35
+            and samples[-1]['time'] >= result['fio_finished'] - 65
+            and (coverage['max_observed_gap_s'] or 0) <= 65)
+        try:
+            after = health(node['path'], directory, 'after')
+            result['health'] = smart_delta(before, after)
+            if result['health']['status'] != 'NO_NEW_RECORDED_FAULT':
+                result['status'] = 'HEALTH_REVIEW_REQUIRED'
+            if (not temperatures or len(temperatures) != len(samples)
+                    or sampler_failed.is_set() or not coverage['spans_fio']):
+                result['status'] = 'TEMPERATURE_EVIDENCE_INCOMPLETE'
+        except Exception as exc:
+            result['after_error'] = str(exc)
+            result['status'] = 'HEALTH_EVIDENCE_INCOMPLETE'
+        save(directory / 'result.json', result)
+    return result
+
+
+def identity(inv, tag, device, serial):
+    node = inv['nodes'].get(Path(device).name)
+    if (inv['service_tag'] != tag or not tag or not node or node['path'] != device
+            or node['type'] != 'disk' or (node.get('serial') or '').strip() != serial
+            or not re.fullmatch(r'[A-Za-z0-9_.-]+', serial)):
+        raise RuntimeError('host/device identity mismatch')
+    return node
+
+
+def scratch(args, inv):
+    node = identity(inv, args.expected_tag, args.device, args.serial)
+    _, edges = flatten(inv['lsblk'])
+    children = descendants(node['kname'], edges)
+    if not any('/' in (inv['nodes'][name].get('mountpoints') or []) for name in children):
+        raise RuntimeError('--device is not the OS backing disk')
+    source = os.path.realpath(args.scratch_source or '')
+    directory = Path(args.scratch_dir or '').resolve()
+    mount = json.loads(checked(['findmnt', '--json', '--target', str(directory),
+                               '--output', 'SOURCE,TARGET']))['filesystems'][0]
+    if (directory == Path('/') or Path(mount['target']).resolve() != directory
+            or os.path.realpath(mount['source']) != source):
+        raise RuntimeError('scratch directory must be the exact mounted, explicitly named LV')
+    matched = [inv['nodes'][name] for name in children
+               if os.path.realpath(inv['nodes'][name]['path']) == source]
+    if len(matched) != 1 or matched[0]['type'] != 'lvm':
+        raise RuntimeError('scratch source must be an LV on the declared OS disk')
+    size = args.scratch_gib * 1024**3
+    if size <= 0 or size > shutil.disk_usage(directory).free * 0.7:
+        raise RuntimeError('scratch size must fit within 70% of currently free space')
+    import tempfile
+    owned = Path(tempfile.mkdtemp(prefix='drive-acceptance-', dir=directory))
+    job = args.out / 'scratch.fio'
+    job.write_text(fio_job(str(owned / 'crc.bin'), size, True, regular=True))
+    save(args.out / 'scratch-owned.json', {'path': str(owned), 'source': source,
+          'deletion_condition': 'remove only this directory after evidence is harvested'})
+    before = health(node['path'], args.out, 'before')
+    p = subprocess.run(['fio', '--output-format=json', f'--output={args.out / "fio.json"}', str(job)],
+                       stdout=(args.out / 'fio.stdout').open('w'), stderr=(args.out / 'fio.stderr').open('w'))
+    after = health(node['path'], args.out, 'after')
+    result = {'test': 'OS_SCRATCH_ONLY_CRC32C', 'bytes': size, 'health': smart_delta(before, after),
+              'full_os_write_coverage': False, 'status': 'FAILED'}
+    if (p.returncode == 0 and fio_pass(json.loads((args.out / 'fio.json').read_text()), size, True)
+            and result['health']['status'] == 'NO_NEW_RECORDED_FAULT'):
+        result['status'] = 'SCRATCH_BYTES_VERIFIED'
+    save(args.out / 'result.json', result)
+    return result['status'] == 'SCRATCH_BYTES_VERIFIED'
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('mode', choices=['inventory', 'plan', 'run', 'os-read', 'scratch'])
+    parser.add_argument('--out', type=Path, required=True, help='must not already exist')
+    parser.add_argument('--expected-tag')
+    parser.add_argument('--allowlist', type=Path)
+    parser.add_argument('--parallel', type=int, default=4)
+    parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--device')
+    parser.add_argument('--serial')
+    parser.add_argument('--scratch-source')
+    parser.add_argument('--scratch-dir')
+    parser.add_argument('--scratch-gib', type=int, default=4)
+    args = parser.parse_args()
+    if not 1 <= args.parallel <= 24:
+        parser.error('--parallel must be 1..24')
+    for tool in ['lsblk', 'swapon', 'findmnt', 'dmidecode', 'ip', 'nvme', 'fio', 'blkdiscard']:
+        if not shutil.which(tool):
+            parser.error(f'missing required tool: {tool}')
+    args.out.mkdir(parents=True, exist_ok=False)
+    inv = inventory()
+    save(args.out / 'inventory.json', inv)
+    if args.mode == 'scratch':
+        if not args.apply:
+            parser.error('scratch requires --apply and explicit LV/source identity')
+        raise SystemExit(0 if scratch(args, inv) else 1)
+    if args.mode == 'os-read':
+        node = identity(inv, args.expected_tag, args.device, args.serial)
+        _, edges = flatten(inv['lsblk'])
+        if not any('/' in (inv['nodes'][n].get('mountpoints') or [])
+                   for n in descendants(node['kname'], edges)):
+            parser.error('--device must be the physical OS disk')
+        result = one_drive(node, args, writable=False)
+        save(args.out / 'result.json', result)
+        raise SystemExit(0 if result['status'] == 'FULL_BYTES_READ' else 1)
+    if args.mode == 'inventory':
+        for name, node in inv['nodes'].items():
+            if node['type'] == 'disk' and re.fullmatch(r'nvme\d+n\d+', name):
+                directory = args.out / node['serial'].strip()
+                directory.mkdir()
+                health(node['path'], directory, 'inventory')
+        return
+    if not args.allowlist:
+        parser.error('--allowlist required')
+    selected = targets(inv, args.expected_tag, json.loads(args.allowlist.read_text()))
+    save(args.out / 'approved-targets.json', selected)
+    print(json.dumps({'service_tag': inv['service_tag'], 'targets': selected}, indent=2), flush=True)
+    if args.mode == 'plan':
+        if args.apply:
+            parser.error('--apply only accepted for run')
+        return
+    if not args.apply:
+        parser.error('run requires --apply; use plan for review')
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as pool:
+        results = list(pool.map(lambda node: one_drive(node, args), selected))
+    save(args.out / 'results.json', results)
+    raise SystemExit(0 if all(x['status'] == 'FULL_BYTES_VERIFIED' for x in results) else 1)
+
+
+if __name__ == '__main__':
+    main()
+PYDRIVE
 
 # ─── probe.py: lanes, L3 dirs, inventory, error-counter snapshots, the 1 Hz sampler ───
 cat >"$LIB/probe.py" <<'PY'
@@ -333,10 +829,18 @@ def avail_bytes(path):
 
 
 def cmd_diskdirs(a):
-    lanes = json.load(open(a.lanes))
+    with open(a.lanes) as source:
+        lanes = json.load(source)
     dirs = [d for d in (a.dirs or "").split(",") if d]
     out = []
     if dirs:
+        if len(set(dirs)) != len(dirs):
+            raise SystemExit("--disk-dirs contains duplicate paths")
+        # One store leg per selected directory, even when there are fewer NICs.
+        original = lanes
+        lanes = [dict(original[i % len(original)], idx=i) for i in range(max(len(original), len(dirs)))]
+        with open(a.lanes, "w") as target:
+            json.dump(lanes, target, indent=1)
         for i, l in enumerate(lanes):
             d = dirs[i % len(dirs)]
             sub = os.path.join(d, f"mcl-{os.getpid()}-{time.time_ns()}/lane{i}")
@@ -1469,10 +1973,14 @@ def main(run):
     if len(lanes) > 1:
         for op in ("write", "read"):
             both = sum(fab.get(f"te-{op}-all-{l['idx']}") or 0 for l in lanes)
-            alone = sum(fab.get(f"te-{op}-{l['idx']}") or 0 for l in lanes)
+            by_port = {}
+            for l in lanes:
+                key = (l.get("dev") or l.get("netdev"), l.get("port"))
+                by_port[key] = max(by_port.get(key, 0), fab.get(f"te-{op}-{l['idx']}") or 0)
+            alone = sum(by_port.values())
             if alone:
                 floor(sec, f"all lanes at once, {op} Gb/s", both, TH["all_lanes_min_frac_sum"] * alone, None, "{:.1f}",
-                      f"{both / alone:.0%} of the lanes' sum alone: < 90% = shared PCIe slot, socket link or memory bandwidth")
+                      f"{both / alone:.0%} of unique physical ports measured alone; shared-leg NIC bandwidth is counted once")
     for l in lanes:
         win = W.get(f"fabric:te-write-{l['idx']}")
         if win:
@@ -1490,7 +1998,8 @@ def main(run):
     if not stream:
         add(sec, "STREAM triad", "not run", "", "SKIP")
     for (n, m), v in sorted(stream.items()):
-        nic_gbs = sum((l.get("rate_gbit") or 0) / 8 for l in lanes if str(l.get("numa")) == n) or max((l.get("rate_gbit") or 0) / 8 for l in lanes) if lanes else 0
+        physical_ports = {(l.get("dev") or l.get("netdev"), l.get("port")): l for l in lanes}
+        nic_gbs = sum((l.get("rate_gbit") or 0) / 8 for l in physical_ports.values() if str(l.get("numa")) == n) or max(((l.get("rate_gbit") or 0) / 8 for l in lanes), default=0)
         if n == m:
             floor(sec, f"triad node {n} local GB/s", v, TH["dram_local_x_nic"] * nic_gbs if nic_gbs else 0, None, "{:.1f}",
                   f"needs {TH['dram_local_x_nic']}x the {nic_gbs:.0f} GB/s of wire on this node: RDMA in, bucket write, restore read, RDMA out")
@@ -1598,6 +2107,7 @@ def main(run):
             # did those bytes really come off the disks?
             dsk = l.get("disk_nvme") or []
             win = W.get("store:get_nvme")
+            st = None
             if win and dsk and gn["bytes"]:
                 st = series["server"].stats(win[0], win[1], inv.get("server"), lanes)
                 if st:
@@ -1607,6 +2117,8 @@ def main(run):
                     att = rd_bytes / max(tot_bytes, 1)
                     floor(sec, f"lane {i} L3 read attribution (disk bytes / bytes served)", att, TH["l3_read_attribution_min"], None, "{:.2f}",
                           "below = the 'NVMe' gets were served from DRAM or page cache: the L3 number is not an L3 number")
+            if not (win and dsk and gn["bytes"] and st):
+                add(sec, f"lane {i} L3 read attribution", "missing", "phase-aligned physical reads", "FAIL")
             if "mixed" in P:
                 m = P["mixed"][si]
                 add(sec, f"lane {i} mixed: put + get GB/s", f"{m['put']['gbps']:.2f} + {m['get']['gbps']:.2f}", "", "INFO",
@@ -1638,6 +2150,10 @@ def main(run):
                     "from the leg log: the transport the leg actually installed")
             if "io_uring_queue_init failed" in leg:
                 add(sec, f"lane {i} leg io_uring restore path", "io_uring_queue_init failed", "io_uring", "FAIL", "restores silently degrade to POSIX reads")
+            slow_path = [line for line in leg.splitlines()
+                         if re.search(r"(?:register.*buffer|fixed.*buffer).*fail|fallback.*(?:pread|posix)|falling back.*(?:pread|posix)", line, re.I)]
+            if slow_path:
+                add(sec, f"lane {i} registered-buffer restore path", "degraded", "no fallback", "FAIL", slow_path[0][-240:])
             for name, txt in (("leg", leg), ("master", mst)):
                 fatal = [x for x in txt.splitlines() if re.match(r"^F\d{4}", x) or "Check failed" in x or "Segmentation fault" in x or "core dumped" in x]
                 errl = [x for x in txt.splitlines() if re.match(r"^E\d{4}", x) and "Local segment descriptor not found" not in x]
@@ -1722,7 +2238,12 @@ def master_metrics(sec, l, path, P, si):
     m = prom(path)
     i = l["idx"]
     if not m:
-        add(sec, f"lane {i} master metrics", "unavailable", "", "SKIP"); return
+        add(sec, f"lane {i} master metrics", "unavailable", "L3 evidence required", "FAIL"); return
+    hits = m.get("file_cache_hit_nums_")
+    restored = m.get("file_cache_hit_bytes_total")
+    add(sec, f"lane {i} master: SSD hits", hits if hits is not None else "missing", "> 0", "PASS" if hits and hits > 0 else "FAIL",
+        "fresh master counter; physical reads during get_nvme must independently confirm L3 attribution")
+    add(sec, f"lane {i} master: SSD bytes", restored if restored is not None else "missing", "> 0", "PASS" if restored and restored > 0 else "FAIL")
     g = lambda k: m.get(k, 0.0)
     puts = g("master_batch_put_start_items_total") + g("master_put_start_requests_total")
     af = g("master_put_start_alloc_failures_total")
@@ -2541,9 +3062,9 @@ raw_fio_job() {
 fs_fio_job() {
   local tag=$1 dir=$2 eng=$3 per_job=$4 bytes=$5 seconds=$6
   case $tag in
-    bufwrite) printf '[global]\ndirectory=%s\nioengine=psync\ndirect=0\nrw=write\nbs=1M\nnumjobs=8\nfilesize=1G\nsize=%sM\nend_fsync=1\nfsync_on_close=1\nfilename_format=b.$jobnum.$filenum\ngroup_reporting=1\n[w]\n' "$dir" "$per_job" ;;
-    dirwrite) printf '[global]\ndirectory=%s\nioengine=%s\ndirect=1\nrw=write\nbs=1M\niodepth=32\nnumjobs=8\nfilesize=1G\nsize=%sM\nfilename_format=d.$jobnum.$filenum\ngroup_reporting=1\n[w]\n' "$dir" "$eng" "$per_job" ;;
-    objread) printf '[global]\ndirectory=%s\nioengine=%s\ndirect=1\nrw=randread\nbs=%s\nblockalign=4k\niodepth=32\nnumjobs=8\nfilesize=1G\nsize=%sM\nfilename_format=b.$jobnum.$filenum\ntime_based=1\nruntime=%s\nnorandommap=1\nrandrepeat=0\ngroup_reporting=1\n[r]\n' "$dir" "$eng" "$bytes" "$per_job" "$seconds" ;;
+    bufwrite) printf '[global]\ndirectory=%s\nioengine=psync\ndirect=0\nrw=write\nbs=1M\nnumjobs=8\nfilesize=%sM\nsize=%sM\nend_fsync=1\nfsync_on_close=1\nfilename_format=b.$jobnum.$filenum\ngroup_reporting=1\n[w]\n' "$dir" "$per_job" "$per_job" ;;
+    dirwrite) printf '[global]\ndirectory=%s\nioengine=%s\ndirect=1\nrw=write\nbs=1M\niodepth=32\nnumjobs=8\nfilesize=%sM\nsize=%sM\nfilename_format=d.$jobnum.$filenum\ngroup_reporting=1\n[w]\n' "$dir" "$eng" "$per_job" "$per_job" ;;
+    objread) printf '[global]\ndirectory=%s\nioengine=%s\ndirect=1\nrw=randread\nbs=%s\nblockalign=4k\niodepth=32\nnumjobs=8\nfilesize=%sM\nsize=%sM\nfilename_format=b.$jobnum.$filenum\nallow_file_create=0\ntime_based=1\nruntime=%s\nnorandommap=1\nrandrepeat=0\ngroup_reporting=1\n[r]\n' "$dir" "$eng" "$bytes" "$per_job" "$per_job" "$seconds" ;;
     *) die "unknown filesystem benchmark: $tag" ;;
   esac
 }
@@ -2580,7 +3101,7 @@ phase_fs() {   # ceilings of the exact L3 directories the legs will use
       fio --output-format=json --output="$S/nvme/fs-$tag-$i.json" "$S/nvme/fs-$tag-$i.fio" >/dev/null 2>"$S/nvme/fs-$tag-$i.err" &
       pids+=($!)
     done
-    for p in "${pids[@]}"; do wait "$p" || warn "fs $tag fio failed (see nvme/fs-$tag-*.err)"; done
+    for p in "${pids[@]}"; do wait "$p" || die "fs $tag fio failed; refusing to benchmark uninitialized extents (see nvme/fs-$tag-*.err)"; done
     mark "fs:$tag" "$t0" "$(now)" "$S/marks.jsonl"
     for i in $(seq 0 $((n - 1))); do
       "$PY" -c 'import json,sys; j=json.load(open(sys.argv[1])); s=sys.argv[3]; print(f"    lane {sys.argv[2]} {sys.argv[4]}: {sum(x[s][\"bw_bytes\"] for x in j[\"jobs\"])/1e9:.2f} GB/s")' \
@@ -2610,6 +3131,8 @@ for l in lanes:
         raise SystemExit("insufficient scratch disk headroom")
     cap = int(cap_flag) << 30 if cap_flag else (min(usable, mult * (seg << 30)) if mult else usable)
     cap = min(cap, usable) // (1 << 30) * (1 << 30)
+    if cap <= seg << 30:
+        raise SystemExit("L3 capacity must exceed the DRAM segment; increase scratch space/--disk-cap-gb or reduce --segment-gb")
     l.update(segment_bytes=seg << 30, arena_bytes=arena << 30, disk_cap_bytes=max(cap, 1 << 30))
 json.dump(lanes, open(sys.argv[1], "w"), indent=1)
 PY
@@ -2700,9 +3223,12 @@ server_setup() { # $1 = run dir
   "$PY" "$LIB/probe.py" snapshot "$S/before.json" --netdevs "$(lanes_netdevs)"
   start_bg sampler "$PY" "$LIB/probe.py" sample "$S/samples.jsonl" --stop "$S/sampler.stop" --interval "$SAMPLE_S"
   "$PY" "$LIB/probe.py" diskdirs --lanes "$S/lanes.json" --dirs "$DISK_DIRS" --root "$WORK" >"$S/diskdirs.json"
-  "$PY" - "$S/lanes.json" "$S/diskdirs.json" <<'PY'
+  "$PY" - "$S/lanes.json" "$S/diskdirs.json" "$L3_DRIVES" <<'PY'
 import json, sys
 lanes, dd = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+backing = {device for d in dd for device in d["nvme"]}
+if sys.argv[3] and len(backing) != int(sys.argv[3]):
+    raise SystemExit(f"expected {sys.argv[3]} physical NVMe namespaces backing L3, found {len(backing)}: {sorted(backing)}")
 for l, d in zip(lanes, dd):
     l.update(disk_dir=d["dir"], disk_source=d["source"], disk_fstype=d["fstype"], disk_nvme=d["nvme"], disk_avail=d["avail"], disk_shared_by=d["shared_by"])
     nv = d["nvme"][0] if d["nvme"] else None
@@ -2897,7 +3423,7 @@ PY
 # ════════════════════════════════════════════════════════════════════════════════════════════
 new_run() {
   RUN=${OUT:-$WORK/runs/$(date -u +%Y%m%dT%H%M%SZ)-$(hostname -s)-$MODE}
-  mkdir -p "$RUN"
+  mkdir "$RUN" 2>/dev/null || { mkdir -p "$(dirname "$RUN")"; mkdir "$RUN" || die "run directory already exists: $RUN; use a fresh --out"; }
   "$PY" - "$RUN/meta.json" "$MODE" "$PROFILE" "$PROTOCOL" "$MCL_VERSION" "$*" <<'PY'
 import json, socket, sys, time
 json.dump({"mode": sys.argv[2], "profile": sys.argv[3], "protocol_requested": sys.argv[4], "script": sys.argv[5], "argv": sys.argv[6],
@@ -2916,8 +3442,25 @@ finish_report() {
   return $rc
 }
 
+verify_host() {
+  [ -z "$EXPECTED_TAG" ] || [ "$(cat /sys/class/dmi/id/product_serial 2>/dev/null)" = "$EXPECTED_TAG" ] || die "server service tag mismatch; refusing this host"
+  if [ -n "$EXPECTED_DRIVES" ]; then
+    local count=0 path
+    for path in /sys/block/nvme*n*; do [[ ${path##*/} =~ ^nvme[0-9]+n[0-9]+$ ]] && count=$((count + 1)); done
+    [ "$count" = "$EXPECTED_DRIVES" ] || die "expected $EXPECTED_DRIVES NVMe namespaces, found $count"
+  fi
+}
+
+mode_drives() {
+  [ "$(uname -s)" = Linux ] && [ "$(id -u)" = 0 ] || die "drives requires Linux root"
+  install_system
+  local runtime; runtime=$(pick_python) || die "Python required"
+  mkdir -p "$LIB"; write_payload
+  "$runtime" "$LIB/drive_acceptance.py" "$@"
+}
+
 mode_single() {
-  install_all; apply_profile; new_run "$@"
+  verify_host; install_all; apply_profile; new_run "$@"
   trap 'server_cleanup' EXIT
   trap 'server_cleanup; exit 130' INT TERM
   server_setup "$RUN"
@@ -2928,7 +3471,7 @@ mode_single() {
 }
 
 mode_server() {
-  install_all; apply_profile; new_run "$@"
+  verify_host; install_all; apply_profile; new_run "$@"
   trap 'server_cleanup' EXIT
   trap 'server_cleanup; exit 130' INT TERM
   server_setup "$RUN"
@@ -2942,7 +3485,7 @@ mode_server() {
 
 mode_client() {
   [ -n "$SERVER" ] || die "client needs --server <server address>"
-  install_all; apply_profile; new_run "$@"
+  verify_host; install_all; apply_profile; new_run "$@"
   local url="http://${SERVER}"; [[ "$SERVER" == *:* ]] || url="$url:$CTL_PORT"
   client_run "$url"
   finish_report
@@ -2953,11 +3496,12 @@ mode_clean() {
 }
 
 main() {
+  if [ "${1:-}" = drives ]; then shift; mode_drives "$@"; return; fi
   MODE=single
   case "${1:-}" in single|server|client|report|clean) MODE=$1; shift ;; -h|--help|help) usage ;; esac
   PROFILE=quick PROTOCOL=auto NICS="" DISK_DIRS="" SEGMENT_GB="" DISK_CAP_GB="" OBJECT_BYTES=21233664
   WORKERS="" BATCH=4 SERVER="" CTL_PORT=$CTL_PORT_DEFAULT SKIP="" WHEEL=non-cuda MC_VERSION="" NO_INSTALL="" OUT="" FILL_RATIO=1.1
-  LENIENT="" SAMPLE_S=1 REPORT_DIR=""
+  LENIENT="" SAMPLE_S=1 REPORT_DIR="" EXPECTED_TAG="" EXPECTED_DRIVES="" L3_DRIVES="" WHEEL_FILE="" WHEEL_URL="" WHEEL_SHA256=""
   [ "$MODE" = report ] && { REPORT_DIR=${1:?report <run-dir>}; shift; }
   local argv="$*"
   while [ $# -gt 0 ]; do
@@ -2969,7 +3513,11 @@ main() {
       --workers) WORKERS=$2; shift 2 ;;            --batch) BATCH=$2; shift 2 ;;
       --server) SERVER=$2; shift 2 ;;              --ctl-port) CTL_PORT=$2; shift 2 ;;
       --skip) SKIP=$2; shift 2 ;;                  --wheel) WHEEL=$2; shift 2 ;;
+      --wheel-url) WHEEL_URL=$2; shift 2 ;;
+      --wheel-file) WHEEL_FILE=$2; shift 2 ;; --wheel-sha256) WHEEL_SHA256=$2; shift 2 ;;
       --mooncake-version) MC_VERSION=$2; shift 2 ;; --no-install) NO_INSTALL=1; shift ;;
+      --expected-tag) EXPECTED_TAG=$2; shift 2 ;; --expected-drives) EXPECTED_DRIVES=$2; shift 2 ;;
+      --l3-drives) L3_DRIVES=$2; shift 2 ;;
       --out) OUT=$2; shift 2 ;;                    --fill-ratio) FILL_RATIO=$2; shift 2 ;;
       --lenient) LENIENT=1; shift ;;               --sample-s) SAMPLE_S=$2; shift 2 ;;
       -h|--help) usage ;;

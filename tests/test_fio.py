@@ -54,6 +54,24 @@ class FioTests(unittest.TestCase):
                                  'test', str(SCRIPT), str(self.target)], capture_output=True)
         self.assertEqual(result.returncode, 2)
 
+    def test_full_crc_job_writes_and_verifies_bulk_and_tail(self):
+        from test_runner import module
+        accept = module('drive_acceptance')
+        size = (2 << 20) + 4096
+        # psync lets the data-integrity test run in CI containers whose seccomp
+        # policy disallows io_uring; deployed jobs retain io_uring.
+        job = self.root / 'verify.fio'
+        job.write_text(accept.fio_job(self.root / 'crc.bin', size, True, regular=True)
+                       .replace('ioengine=io_uring', 'ioengine=psync').replace('iodepth=32', 'iodepth=1'))
+        parsed = subprocess.run([self.fio, '--parse-only', str(job)], capture_output=True, text=True)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        output = self.root / 'verify.json'
+        result = subprocess.run([self.fio, '--output-format=json', f'--output={output}', str(job)],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        import json
+        self.assertTrue(accept.fio_pass(json.loads(output.read_text()), size, True))
+
     def test_all_filesystem_jobs_parse(self):
         for mode in ('bufwrite', 'dirwrite', 'objread'):
             job = self.emit('fs_fio_job', mode, self.root, 'libaio', '128', '21233664', '1')

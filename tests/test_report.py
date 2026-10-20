@@ -66,6 +66,20 @@ class ReportTests(unittest.TestCase):
         cls.report = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.report)
 
+    def test_missing_or_zero_ssd_telemetry_cannot_qualify_l3(self):
+        for content in ['', 'file_cache_hit_nums_ 0\nfile_cache_hit_bytes_total 0\n',
+                        'file_cache_hit_nums_ 2\nfile_cache_hit_bytes_total 8192\n']:
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory, 'metrics')
+                path.write_text(content)
+                with patch.object(self.report, 'rows', []):
+                    self.report.master_metrics('store', {'idx': 0}, path, {}, '0')
+                    checks = list(self.report.rows)
+                if '8192' in content:
+                    self.assertTrue(all(row['verdict'] == 'PASS' for row in checks if 'SSD' in row['check']))
+                else:
+                    self.assertTrue(any(row['verdict'] == 'FAIL' for row in checks))
+
     @classmethod
     def tearDownClass(cls):
         cls.payload.cleanup()

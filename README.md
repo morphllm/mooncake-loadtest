@@ -16,6 +16,40 @@ curl -fsSL https://raw.githubusercontent.com/morphllm/mooncake-loadtest/COMMIT_S
 
 No credentials are embedded in the launcher or transmitted to the server. Do not configure your GitHub account on test machines. Reports contain hardware inventory, IPs and logs; review those before sharing them publicly.
 
+## One-shot server qualification
+
+A compatible reviewed wheel must be supplied when the released CPU wheel lacks the registered-buffer fix; the launcher does not rebuild Mooncake or silently claim that the public wheel contains it. The default CPU wheel is `--wheel non-cuda`; `--mooncake-version` pins its version. For a reviewed custom CPU build, pass `--wheel-url https://HOST/PACKAGE.whl --wheel-sha256 SHA256`, or download it first and use `--wheel-file /path/build.whl --wheel-sha256 SHA256`; both normal installs and `--no-install` validate the requested package flavor/version, import, and master executable.
+
+Pin the launcher to a reviewed commit and run it separately on **each physical server**. Keep the DMI service tag, drive count, and intended L3 backing count in the command so a Windows jump host, wrong SSH tab, or root-only scratch filesystem cannot qualify the storage node:
+
+```sh
+sudo bash mooncake-loadtest.sh single --expected-tag SERVICE_TAG --expected-drives 24 \
+  --l3-drives 23 --disk-dirs /mnt/l3 \
+  --protocol rdma --mooncake-version VERSION --segment-gb 4 --disk-cap-gb 32 \
+  --out /opt/mooncake-loadtest/runs/UNIQUE_RUN
+```
+
+The example assumes `/mnt/l3` is an already-mounted aggregate backed by exactly 23 data drives. For individual mounts, list **all intended mounted data directories** in `--disk-dirs`, separated by commas. Every listed directory gets a store leg even if the node has only one NIC. Legs share NICs round-robin with separate ports; fabric comparisons count each physical NIC port once. `--l3-drives` counts unique underlying NVMe namespaces, so repeated paths on the boot drive cannot pass a 23-drive check. A single mounted array spanning all data drives can also satisfy that check. Provisioning and mounting the array is a separate operator action. The runner does not format drives. More legs divide the DRAM budget; explicit segment and disk sizes are per leg. The L3 capacity must exceed the DRAM segment. Existing output directories are rejected to keep samples and phase windows from different runs apart.
+
+A performance run is not full drive acceptance. The same downloaded launcher includes a guarded, full-capacity test:
+
+```sh
+sudo bash mooncake-loadtest.sh drives inventory --out /var/tmp/drive-inventory-UNIQUE
+# Review inventory.json. Write an explicit JSON array containing ONLY data drives:
+# [{"device":"/dev/nvme1n1","serial":"EXACT_SERIAL","bytes":15363000000000}]
+sudo bash mooncake-loadtest.sh drives plan --expected-tag SERVICE_TAG \
+  --allowlist /root/approved-data-drives.json --out /var/tmp/drive-plan-UNIQUE
+# DESTRUCTIVE: erases every allowlisted data drive, then writes and reads its full capacity.
+sudo systemd-run --unit=drive-acceptance-UNIQUE --service-type=exec \
+  bash /root/mooncake-loadtest.sh drives run --expected-tag SERVICE_TAG \
+  --allowlist /root/approved-data-drives.json --parallel 23 --apply \
+  --out /var/tmp/drive-result-UNIQUE
+```
+
+The allowlist requires the live path, serial and exact byte capacity. The test checks them again before each erase, rejects boot/mounted/swap/held/open/read-only devices, and writes CRC32c across every byte including the tail. It saves per-drive fio results, before/after SMART and error logs, sampled health, and a result only passing with complete write/read byte counts and healthy evidence. Full-capacity testing can take hours. The boot disk remains protected: `drives os-read` reads it fully, and `drives scratch` verifies only an explicitly identified scratch LV; neither certifies full boot-disk writes. Use `drives --help` for these modes. Collect evidence before deleting only the exact test-owned scratch paths.
+
+After acceptance, provision the intended L3 filesystems and run the guarded Mooncake command above. A failed or unreachable second server still needs its own completed run. Registered-buffer and restore-path fallbacks fail qualification instead of silently accepting slower results.
+
 ## Separate store and load generator
 
 Use a second server on the intended RDMA fabric to measure end-to-end serving traffic. Allow only your test client to reach the store/control ports; the temporary control endpoint is unauthenticated. It exposes inventory and can finish this test. Defaults: control TCP 50090; lane `i` uses ports starting at `50100 + 20*i` (master, metrics, store, transfer engine and fabric benchmarks).
