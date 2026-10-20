@@ -71,11 +71,27 @@ class SetupTests(unittest.TestCase):
     def test_wheel_url_requires_https_named_artifact_and_checksum(self):
         for url, digest in [('http://example.com/test.whl', 'a' * 64),
                             ('https://example.com/download', 'a' * 64),
+                            ('https://example.com/path%2Ftest.whl', 'a' * 64),
+                            ('https://example.com/..%2Ftest.whl', 'a' * 64),
+                            ('https://example.com/path%5Ctest.whl', 'a' * 64),
                             ('https://example.com/test.whl', '')]:
             result = subprocess.run(['bash', '-c',
                 'source "$1"; WHEEL_URL="$2"; WHEEL_SHA256="$3"; WHEEL_FILE=""; prepare_wheel python3',
                 'test', str(ROOT / 'mooncake-loadtest.sh'), url, digest], capture_output=True, text=True)
             self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_wheel_url_decodes_local_version_plus_without_changing_request(self):
+        with tempfile.TemporaryDirectory() as root:
+            url = 'https://example.com/package-1.0%2Bfix-cp313-cp313-linux_x86_64.whl'
+            result = subprocess.run(['bash', '-c',
+                'source "$1"; WORK="$2"; WHEEL_URL="$3"; WHEEL_SHA256="$(printf a%.0s {1..64})"; WHEEL_FILE=""; '
+                'curl() { local last; for last in "$@"; do :; done; printf "%s" "$WHEEL_URL" > "$last"; }; '
+                'prepare_wheel python3; printf "%s" "$WHEEL_FILE"',
+                'test', str(ROOT / 'mooncake-loadtest.sh'), root, url], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            artifact = Path(result.stdout)
+            self.assertEqual(artifact.name, 'package-1.0+fix-cp313-cp313-linux_x86_64.whl')
+            self.assertEqual(artifact.read_text(), url)
 
     def test_read_files_are_initialized_to_exact_extent(self):
         result = subprocess.run(['bash', '-c', 'source "$1"; fs_fio_job objread /tmp/fio libaio 128 21233664 1', 'test', str(ROOT / 'mooncake-loadtest.sh')], capture_output=True, text=True, check=True)

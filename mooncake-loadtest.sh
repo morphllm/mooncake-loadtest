@@ -129,10 +129,11 @@ prepare_wheel() {
     [ -z "$WHEEL_FILE" ] && [[ "$WHEEL_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || die "--wheel-url requires SHA256 and cannot combine with --wheel-file"
     local artifact
     artifact=$("$py" - "$WHEEL_URL" <<'PYURL'
-import posixpath, sys, urllib.parse
+import posixpath, re, sys, urllib.parse
 url = urllib.parse.urlsplit(sys.argv[1])
-name = posixpath.basename(url.path)
-if url.scheme != "https" or not url.netloc or not name.endswith(".whl"):
+name = urllib.parse.unquote(posixpath.basename(url.path))
+if (url.scheme != "https" or not url.netloc
+        or not re.fullmatch(r"[A-Za-z0-9_.+-]+\.whl", name)):
     raise SystemExit("wheel URL must be HTTPS and end in a wheel filename")
 print(name)
 PYURL
