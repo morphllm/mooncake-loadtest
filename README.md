@@ -52,6 +52,21 @@ The allowlist requires the live path, serial and exact byte capacity. The test c
 
 After acceptance, provision the intended L3 filesystems and run the guarded Mooncake command above. A failed or unreachable second server still needs its own completed run. Registered-buffer and restore-path fallbacks fail qualification instead of silently accepting slower results.
 
+## Verified host tuning
+
+See [storage provisioning](docs/storage-provisioning.md) for NUMA placement, registered I/O, hugepages and fabric checks. On a dedicated two-NUMA-node test server, wrap the reviewed launcher with `scripts/system_profile.py` to reserve 32 GiB of 2 MiB HugeTLB pages per node, set performance governors, disable automatic NUMA balancing, and verify process limits. It rejects active fio jobs and records/restores the prior settings; allocation failure prevents the benchmark from starting.
+
+```sh
+sudo python3 scripts/system_profile.py --expected-tag SERVICE_TAG \
+  --evidence /var/tmp/system-profile-UNIQUE -- \
+  bash mooncake-loadtest.sh single --expected-tag SERVICE_TAG --expected-drives 24 \
+  --l3-drives 23 --disk-dirs /mnt/l3-numa0,/mnt/l3-numa1 \
+  --protocol tcp --mooncake-version VERSION --segment-gb 16 --disk-cap-gb 64 \
+  --out /opt/mooncake-loadtest/runs/UNIQUE_RUN
+```
+
+This example is a same-host TCP diagnostic. For remote RDMA, select active HCAs and size the page reservation for their actual NUMA placement. The profile is a bounded benchmark configuration, not production memory sizing. Check its runtime samples for actual HugeTLB backing and NUMA/CPU placement. It neither provisions drives nor activates a disconnected RDMA fabric.
+
 ## Separate store and load generator
 
 Use a second server on the intended RDMA fabric to measure end-to-end serving traffic. Allow only your test client to reach the store/control ports; the temporary control endpoint is unauthenticated. It exposes inventory and can finish this test. Defaults: control TCP 50090; lane `i` uses ports starting at `50100 + 20*i` (master, metrics, store, transfer engine and fabric benchmarks).
