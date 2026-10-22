@@ -83,7 +83,7 @@ docs/fleet-qualification.md
 - [x] Consolidate drive checks and pool ownership/recovery.
 - [x] Implement and test node stages and parallel fleet commands.
 - [x] Document one-shot usage and acceptance limits.
-- [ ] Run Linux checks, review, commit and push main.
+- [x] Run Linux checks, review, commit and push main (`941cff9`; CI passed).
 - [ ] Complete hardware qualification and verified vendor reporting; keep automation active until finished.
 
 Owners: root integrates the node workflow and validates release; storage_pool agent owns pools; drive_checks agent owns drive checks; fleet agent owns SSH orchestration. Temporary helper deletion condition: after their live runs and evidence harvest are complete, replace them with the maintained modules and remove only task-owned copies.
