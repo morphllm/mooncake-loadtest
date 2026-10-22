@@ -829,6 +829,23 @@ def avail_bytes(path):
     return st.f_bavail * st.f_frsize
 
 
+def backing_numa(namespaces):
+    """A filesystem is local only when every backing namespace has the same known node."""
+    nodes = {num(rd(f"{nvme_sysdev(ns)}/numa_node", "-1")) for ns in namespaces}
+    return next(iter(nodes)) if len(nodes) == 1 and None not in nodes and -1 not in nodes else -1
+
+
+def bind_disk_numa(lane, disk):
+    lane["disk_numa"] = backing_numa(disk["nvme"])
+    if lane.get("dev"):
+        lane["numa_source"] = "nic"
+    else:
+        lane["numa"] = lane["disk_numa"]
+        lane["numa_source"] = "disk" if lane["numa"] >= 0 else "mixed-or-unknown-disk"
+        if lane["numa"] < 0:
+            print(f"WARN lane {lane['idx']}: mixed or unknown backing NVMe NUMA; leaving unbound", file=sys.stderr)
+
+
 def cmd_diskdirs(a):
     with open(a.lanes) as source:
         lanes = json.load(source)
@@ -855,7 +872,7 @@ def cmd_diskdirs(a):
             nv = nvme_under(p[1])
             if nv and int(p[3]) > 20 << 30:
                 cands.append({"mount": p[0], "avail": int(p[3]), "nvme": nv,
-                              "numa": num(rd(f"{nvme_sysdev(nv[0])}/numa_node", "-1"))})
+                              "numa": backing_numa(nv)})
         cands.sort(key=lambda c: -c["avail"])
         picks = []
         for l in lanes:   # NUMA-local NVMe filesystem first, else the largest
@@ -869,6 +886,9 @@ def cmd_diskdirs(a):
         os.makedirs(o["dir"], exist_ok=True)
         f = fs_of(o["dir"])
         o.update(f, nvme=nvme_under(f["source"]), avail=avail_bytes(o["dir"]))
+        bind_disk_numa(lanes[o["lane"]], o)
+    with open(a.lanes, "w") as target:
+        json.dump(lanes, target, indent=1)
     print(json.dumps(out))
 
 
@@ -3029,7 +3049,7 @@ start_bg() { # name cmd...: start in background, record pid for teardown
   echo "$pid $name" >>"$S/pids"; SRV_PIDS+=("$pid")
 }
 numa_pin() { local n=$1; [ -n "$n" ] && [ "$n" -ge 0 ] 2>/dev/null && command -v numactl >/dev/null && echo "numactl -N $n -m $n" || true; }
-lane_field() { "$PY" -c "import json,sys; print(json.load(open(sys.argv[1]))[int(sys.argv[2])].get(sys.argv[3]) or '')" "$S/lanes.json" "$1" "$2"; }
+lane_field() { "$PY" -c "import json,sys; v=json.load(open(sys.argv[1]))[int(sys.argv[2])].get(sys.argv[3]); print('' if v is None else v)" "$S/lanes.json" "$1" "$2"; }
 
 lane_count() { "$PY" -c "import json,sys; print(len(json.load(open(sys.argv[1]))))" "$S/lanes.json"; }
 
@@ -3232,14 +3252,9 @@ if sys.argv[3] and len(backing) != int(sys.argv[3]):
     raise SystemExit(f"expected {sys.argv[3]} physical NVMe namespaces backing L3, found {len(backing)}: {sorted(backing)}")
 for l, d in zip(lanes, dd):
     l.update(disk_dir=d["dir"], disk_source=d["source"], disk_fstype=d["fstype"], disk_nvme=d["nvme"], disk_avail=d["avail"], disk_shared_by=d["shared_by"])
-    nv = d["nvme"][0] if d["nvme"] else None
-    try:
-        l["disk_numa"] = int(open(f"/sys/class/nvme/{nv.rsplit('n', 1)[0]}/device/numa_node").read()) if nv else None
-    except OSError:
-        l["disk_numa"] = None
 json.dump(lanes, open(sys.argv[1], "w"), indent=1)
 for l in lanes:
-    print(f"  lane {l['idx']}: {l['dev'] or l['netdev']} {l['ip']} numa {l['numa']} {l['rate_gbit']} Gb/s -> L3 {l['disk_dir']} ({l['disk_source']} {l['disk_fstype']}, "
+    print(f"  lane {l['idx']}: {l['dev'] or l['netdev']} {l['ip']} numa {l['numa']} ({l.get('numa_source', 'nic')}) {l['rate_gbit']} Gb/s -> L3 {l['disk_dir']} ({l['disk_source']} {l['disk_fstype']}, "
           f"{','.join(l['disk_nvme']) or 'NOT NVMe'}, {l['disk_avail'] / 2**30:.0f} GiB free, shared by {l['disk_shared_by']})", file=sys.stderr)
 PY
   [[ ",$SKIP," == *",dram,"* ]] || phase_dram
@@ -3283,7 +3298,7 @@ fetch() { "$PY" -c 'import sys,urllib.request; sys.stdout.write(urllib.request.u
 
 client_lanes() { # map server lanes to local devices by index; writes $C/lanes.json (with server fields)
   if [ "$MODE" = single ]; then
-    "$PY" -c 'import json,sys; L=json.load(open(sys.argv[1]))["lanes"]; [l.update(local_ip=l["ip"], local_dev=l["dev"]) for l in L]; json.dump(L, open(sys.argv[2],"w"), indent=1)' "$C/info.json" "$C/lanes.json"
+    "$PY" -c 'import json,sys; L=json.load(open(sys.argv[1]))["lanes"]; [l.update(local_ip=l["ip"], local_dev=l["dev"], local_numa=l["numa"], local_netdev=l["netdev"], local_rate_gbit=l["rate_gbit"]) for l in L]; json.dump(L, open(sys.argv[2],"w"), indent=1)' "$C/info.json" "$C/lanes.json"
     return
   fi
   "$PY" "$LIB/probe.py" lanes --protocol "$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["protocol"])' "$C/info.json")" --nics "$NICS" >"$C/local-lanes.json"
@@ -3299,7 +3314,7 @@ for i, l in enumerate(srv):
 json.dump(out, open(sys.argv[3], "w"), indent=1)
 PY
 }
-cl_field() { "$PY" -c "import json,sys; print(json.load(open(sys.argv[1]))[int(sys.argv[2])].get(sys.argv[3]) or '')" "$C/lanes.json" "$1" "$2"; }
+cl_field() { "$PY" -c "import json,sys; v=json.load(open(sys.argv[1]))[int(sys.argv[2])].get(sys.argv[3]); print('' if v is None else v)" "$C/lanes.json" "$1" "$2"; }
 
 fabric_one() { # lane op tag
   local i=$1 op=$2 tag=$3 dev ip sip node use_vram=""

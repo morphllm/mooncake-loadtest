@@ -30,6 +30,40 @@ class SetupTests(unittest.TestCase):
             self.assertEqual([l['idx'] for l in json.loads(lanes.read_text())], list(range(24)))
             self.assertTrue(all(Path(r['dir']).is_dir() for r in results))
 
+    def test_node_zero_survives_shell_field_lookup_and_pinning(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, 'lanes.json').write_text('[{"idx":0,"numa":0,"local_numa":0}]')
+            result = subprocess.run(['bash', '-c', 'source "$1"; PY=python3; S="$2"; C="$2"; numactl() { :; }; node=$(lane_field 0 numa); numa_pin "$node"; cl_field 0 local_numa', 'test', str(ROOT / 'mooncake-loadtest.sh'), root], check=True, capture_output=True, text=True)
+            self.assertEqual(result.stdout.splitlines(), ['numactl -N 0 -m 0', '0'])
+
+    def test_tcp_lane_uses_all_backing_disks_numa(self):
+        lane = dict(idx=0, dev='', numa=1)
+        with patch.object(probe, 'nvme_sysdev', side_effect=lambda ns: ns), patch.object(probe, 'rd', return_value='0'):
+            probe.bind_disk_numa(lane, dict(nvme=['nvme0n1', 'nvme1n1']))
+        self.assertEqual((lane['numa'], lane['disk_numa'], lane['numa_source']), (0, 0, 'disk'))
+
+    def test_mixed_or_unknown_backing_is_not_called_local(self):
+        for nodes in [('0', '1'), ('0', '-1')]:
+            lane = dict(idx=0, dev='', numa=1)
+            with patch.object(probe, 'nvme_sysdev', side_effect=lambda ns: ns), patch.object(probe, 'rd', side_effect=nodes), contextlib.redirect_stderr(io.StringIO()) as warning:
+                probe.bind_disk_numa(lane, dict(nvme=['nvme0n1', 'nvme1n1']))
+            self.assertEqual((lane['numa'], lane['disk_numa']), (-1, -1))
+            self.assertIn('leaving unbound', warning.getvalue())
+
+    def test_rdma_device_preserves_nic_numa(self):
+        lane = dict(idx=0, dev='mlx5_0', numa=1)
+        with patch.object(probe, 'backing_numa', return_value=0):
+            probe.bind_disk_numa(lane, dict(nvme=['nvme0n1']))
+        self.assertEqual((lane['numa'], lane['disk_numa'], lane['numa_source']), (1, 0, 'nic'))
+
+    def test_single_host_client_inherits_each_disk_lane_numa(self):
+        with tempfile.TemporaryDirectory() as root:
+            client = Path(root)
+            lanes = [dict(idx=i, ip='127.0.0.1', dev='', netdev='lo', rate_gbit=None, numa=i) for i in range(2)]
+            (client / 'info.json').write_text(json.dumps(dict(lanes=lanes)))
+            subprocess.run(['bash', '-c', 'source "$1"; MODE=single; PY=python3; C="$2"; client_lanes', 'test', str(ROOT / 'mooncake-loadtest.sh'), root], check=True)
+            self.assertEqual([l['local_numa'] for l in json.loads((client / 'lanes.json').read_text())], [0, 1])
+
     def test_duplicate_explicit_directory_is_rejected(self):
         with tempfile.TemporaryDirectory() as root:
             lanes = Path(root, 'lanes.json')

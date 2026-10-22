@@ -31,6 +31,8 @@ sudo bash mooncake-loadtest.sh single --expected-tag SERVICE_TAG --expected-driv
 
 The example assumes `/mnt/l3` is an already-mounted aggregate backed by exactly 23 data drives. For individual mounts, list **all intended mounted data directories** in `--disk-dirs`, separated by commas. Every listed directory gets a store leg even if the node has only one NIC. Legs share NICs round-robin with separate ports; fabric comparisons count each physical NIC port once. `--l3-drives` counts unique underlying NVMe namespaces, so repeated paths on the boot drive cannot pass a 23-drive check. A single mounted array spanning all data drives can also satisfy that check. Provisioning and mounting the array is a separate operator action. The runner does not format drives. More legs divide the DRAM budget; explicit segment and disk sizes are per leg. The L3 capacity must exceed the DRAM segment. Existing output directories are rejected to keep samples and phase windows from different runs apart.
 
+TCP diagnostic lanes without an RDMA device bind the store and same-host client to the backing NVMe NUMA node when every backing drive belongs to that node. Separate NUMA-local mounted groups can be listed in `--disk-dirs /mnt/l3-numa0,/mnt/l3-numa1`; `--l3-drives 23` still checks the combined backing count. Mixed or unknown backing nodes remain unbound with a warning. RDMA lanes retain their NIC locality. Check `server/lanes.json`, `client/lanes.json` and the setup log for the selected nodes.
+
 A performance run is not full drive acceptance. The same downloaded launcher includes a guarded, full-capacity test:
 
 ```sh
