@@ -72,10 +72,10 @@ usage() { sed -n '2,46p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null | sed 's/^# 
 # ════════════════════════════════════════════════════════════════════════════════════════════
 # Install: system tools + an isolated venv with the Mooncake wheel. Idempotent.
 # ════════════════════════════════════════════════════════════════════════════════════════════
-APT_PKGS="python3 python3-venv python3-pip fio nvme-cli pciutils dmidecode numactl iproute2 ethtool rdma-core ibverbs-providers
+APT_PKGS="python3 python3-venv python3-pip fio nvme-cli lvm2 xfsprogs udev pciutils dmidecode numactl iproute2 ethtool rdma-core ibverbs-providers
   ibverbs-utils infiniband-diags perftest libibverbs1 librdmacm1 libnuma1 libcurl4 libgomp1 gcc libc6-dev curl tar
   util-linux procps kmod"
-DNF_PKGS="python3 python3-pip fio nvme-cli pciutils dmidecode numactl iproute ethtool rdma-core libibverbs libibverbs-utils
+DNF_PKGS="python3 python3-pip fio nvme-cli lvm2 xfsprogs systemd-udev pciutils dmidecode numactl iproute ethtool rdma-core libibverbs libibverbs-utils
   librdmacm infiniband-diags perftest numactl-libs libcurl libgomp gcc glibc-devel curl tar util-linux procps-ng kmod"
 
 install_system() {
@@ -95,7 +95,7 @@ install_system() {
       for p in $DNF_PKGS; do "$pm" install -y -q "$p" >/dev/null 2>&1 || warn "dnf: $p unavailable"; done
     fi
   else
-    warn "no apt-get/dnf: install fio nvme-cli pciutils dmidecode numactl ethtool rdma-core perftest gcc python3 yourself"
+    warn "no apt-get/dnf: install fio nvme-cli lvm2 xfsprogs pciutils dmidecode numactl ethtool rdma-core perftest gcc python3 yourself"
   fi
 }
 

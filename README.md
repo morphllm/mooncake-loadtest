@@ -54,6 +54,8 @@ After acceptance, provision the intended L3 filesystems and run the guarded Moon
 
 ## Verified host tuning
 
+For repeatable multi-server acceptance, use the [parallel fleet workflow](docs/fleet-qualification.md): reviewed per-node identities, full data-drive CRC, isolated read/health tables, temporary pools, Mooncake, resumable state and evidence collection.
+
 See [storage provisioning](docs/storage-provisioning.md) for NUMA placement, registered I/O, hugepages and fabric checks. On a dedicated two-NUMA-node test server, wrap the reviewed launcher with `scripts/system_profile.py` to reserve 32 GiB of 2 MiB HugeTLB pages per node, set performance governors, disable automatic NUMA balancing, and verify process limits. It rejects active fio jobs and records/restores the prior settings; allocation failure prevents the benchmark from starting.
 
 ```sh
